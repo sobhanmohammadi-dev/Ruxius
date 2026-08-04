@@ -1,0 +1,361 @@
+// This binary always builds with the default console subsystem so that
+// `rux php add/list/remove`, `rux build`, and `--help` reliably print their
+// output in a terminal (a GUI-subsystem exe's stdout/stderr does not
+// reliably show up when run from PowerShell/cmd). When we're actually
+// about to launch a bundled app's WebView window, `hide_console_window()`
+// below hides the console at runtime instead, so double-clicking a built
+// .exe doesn't leave a console window behind.
+
+mod cli;
+mod config;
+mod error;
+mod extract;
+mod logger;
+mod payload;
+mod php;
+mod version;
+mod webview;
+
+use clap::{CommandFactory, Parser};
+use cli::{Cli, Command, PhpAction};
+use config::AppConfig;
+use error::{LauncherError, Result};
+use fs2::FileExt;
+use php::PhpServer;
+use std::fs::{File, OpenOptions};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
+
+const APP_QUALIFIER: &str = "com";
+const APP_ORGANIZATION: &str = "Ruxius";
+const APP_NAME: &str = "Ruxius";
+
+const WINDOW_TITLE: &str = "Ruxius";
+const WINDOW_WIDTH: u32 = 1400;
+const WINDOW_HEIGHT: u32 = 900;
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+
+    let result = match cli.command {
+        None => run_bare(),
+        Some(Command::Build {
+            app_path,
+            php,
+            output_path,
+        }) => run_build_command(&app_path, &php, &output_path),
+        Some(Command::Php { action }) => run_php_command(action),
+    };
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            log::error!("Fatal error: {e:#}");
+            eprintln!("rux: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// bare `rux` — launch the bundled app if this is a built exe, otherwise
+// show the normal clap help (this is the builder)
+// ---------------------------------------------------------------------
+
+fn run_bare() -> Result<()> {
+    let current_exe = std::env::current_exe().map_err(LauncherError::Io)?;
+
+    if payload::detect(&current_exe)?.is_some() {
+        // A built app: this is what happens when someone double-clicks the
+        // .exe produced by `rux build`. No commands involved.
+        return run_app(&current_exe);
+    }
+
+    // The bare builder tool with nothing bundled: behave like a normal CLI
+    // and show the standard clap help instead of trying to open a window.
+    Cli::command().print_help().ok();
+    println!();
+    Ok(())
+}
+
+fn run_app(current_exe: &Path) -> Result<()> {
+    let payload_info = payload::detect(current_exe)?.ok_or_else(|| {
+        LauncherError::Extraction("no app bundled in this executable".into())
+    })?;
+
+    // From here on we're opening a native window, not printing CLI output,
+    // so hide the console window a double-click would otherwise flash open.
+    hide_console_window();
+
+    let data_dir = data_dir()?;
+    std::fs::create_dir_all(&data_dir)?;
+
+    logger::init(&data_dir).map_err(LauncherError::Other)?;
+    install_panic_hook();
+
+    log::info!(
+        "Ruxius {} starting bundled app (pid {})",
+        version::LAUNCHER_VERSION,
+        std::process::id()
+    );
+
+    let _instance_lock = acquire_single_instance_lock(&data_dir)?;
+
+    let checksum_hex = payload_info.checksum_hex();
+    let extract_root = data_dir.join("apps").join(&checksum_hex);
+    let compressed_payload = payload::read_payload_bytes(current_exe, &payload_info)?;
+    let bundle_dir = extract::ensure_extracted(&extract_root, &compressed_payload, &checksum_hex)?;
+
+    let php_server = PhpServer::start(&bundle_dir)?;
+    let url = php_server.url();
+    log::info!("PHP backend ready at {url}");
+
+    // Shared so both the Ctrl+C handler and the window's close callback can
+    // guarantee the PHP process is terminated exactly once, from whichever
+    // path triggers first.
+    let php_server = Arc::new(Mutex::new(Some(php_server)));
+
+    install_ctrlc_handler(Arc::clone(&php_server));
+
+    let webview_server_handle = Arc::clone(&php_server);
+    let shutdown = move || {
+        log::info!("Performing graceful shutdown.");
+        if let Ok(mut guard) = webview_server_handle.lock() {
+            if let Some(mut server) = guard.take() {
+                server.shutdown();
+            }
+        }
+        log::info!("Shutdown complete.");
+    };
+
+    webview::run(&url, WINDOW_TITLE, WINDOW_WIDTH, WINDOW_HEIGHT, shutdown)?;
+
+    // Unreachable in practice: tao's event loop takes over the process and
+    // exits it directly. Kept for completeness / non-Windows testing.
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// `rux build <app-path> <php> <output-path>` — package, don't compile
+// ---------------------------------------------------------------------
+
+fn run_build_command(app_path: &Path, php: &str, output_path: &Path) -> Result<()> {
+    if !app_path.is_dir() {
+        return Err(LauncherError::Extraction(format!(
+            "app path '{}' is not a directory",
+            app_path.display()
+        )));
+    }
+
+    let data_dir = data_dir()?;
+    let config = AppConfig::load(&data_dir);
+    let php_path = config.resolve_php_reference(php);
+
+    let resolved = php::resolve_external_php(&php_path).map_err(|e| {
+        LauncherError::PhpStart(format!(
+            "couldn't resolve PHP '{php}' (looked at '{}'): {e}",
+            php_path.display()
+        ))
+    })?;
+    let php_dir = resolved
+        .binary
+        .parent()
+        .ok_or_else(|| LauncherError::PhpStart("resolved PHP binary has no parent dir".into()))?;
+
+    println!("Packaging app:");
+    println!("  app:    {}", app_path.display());
+    println!("  php:    {} ({})", php, resolved.binary.display());
+    if let Some(ext_dir) = &resolved.extension_dir {
+        println!("  ext:    {}", ext_dir.display());
+    } else {
+        println!("  ext:    (none found — extensions will use PHP's own defaults)");
+    }
+    println!("  output: {}", output_path.display());
+
+    let packed = payload::pack(php_dir, app_path)?;
+    println!(
+        "Packed payload: {:.1} MiB",
+        packed.len() as f64 / (1024.0 * 1024.0)
+    );
+
+    let current_exe = std::env::current_exe().map_err(LauncherError::Io)?;
+    payload::build_output(&current_exe, &packed, output_path)?;
+
+    println!("Built {}", output_path.display());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// `rux php add|remove|list`
+// ---------------------------------------------------------------------
+
+fn run_php_command(action: PhpAction) -> Result<()> {
+    let data_dir = data_dir()?;
+    std::fs::create_dir_all(&data_dir)?;
+    let mut config = AppConfig::load(&data_dir);
+
+    match action {
+        PhpAction::Add { name, path } => {
+            let resolved = php::resolve_external_php(&path).map_err(|e| {
+                LauncherError::PhpStart(format!(
+                    "couldn't use '{}' as a PHP install: {e}",
+                    path.display()
+                ))
+            })?;
+            config
+                .php_versions
+                .insert(name.clone(), resolved.binary.clone());
+            config.save(&data_dir).map_err(LauncherError::Other)?;
+            println!("Registered '{name}' -> {}", resolved.binary.display());
+        }
+
+        PhpAction::Remove { name } => {
+            if config.php_versions.remove(&name).is_some() {
+                config.save(&data_dir).map_err(LauncherError::Other)?;
+                println!("Removed '{name}'.");
+            } else {
+                println!("No PHP version named '{name}' is registered.");
+            }
+        }
+
+        PhpAction::List => {
+            if config.php_versions.is_empty() {
+                println!("No PHP versions registered yet. Add one with:");
+                println!("  rux php add <name> \"<path to php.exe>\"");
+            } else {
+                println!("Registered PHP versions:");
+                for (name, path) in &config.php_versions {
+                    let status = match php::resolve_external_php(path) {
+                        Ok(_) => "ok",
+                        Err(_) => "MISSING",
+                    };
+                    println!("  {name:<12} {}  [{status}]", path.display());
+                }
+            }
+
+            let discovered = discover_php_installations();
+            if !discovered.is_empty() {
+                println!("\nOther PHP installs found on this system:");
+                for path in discovered {
+                    println!("  {}", path.display());
+                }
+                println!("\nRegister one with: rux php add <name> \"<path>\"");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Looks for PHP installs in common Windows locations (`C:\php*`,
+/// `C:\Program Files\PHP*`) and on PATH, purely as a convenience for
+/// `rux php list`. This is best-effort discovery, not exhaustive.
+fn discover_php_installations() -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    for root in ["C:\\", "C:\\Program Files", "C:\\Program Files (x86)"] {
+        let root = Path::new(root);
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy().to_lowercase();
+            if name.starts_with("php") {
+                candidates.push(entry.path());
+            }
+        }
+    }
+
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            candidates.push(dir);
+        }
+    }
+
+    let mut found = Vec::new();
+    for dir in candidates {
+        let candidate = dir.join("php.exe");
+        if candidate.is_file() && !found.contains(&candidate) {
+            found.push(candidate);
+        }
+    }
+    found
+}
+
+// ---------------------------------------------------------------------
+// Shared plumbing
+// ---------------------------------------------------------------------
+
+fn data_dir() -> Result<PathBuf> {
+    let dirs = directories::ProjectDirs::from(APP_QUALIFIER, APP_ORGANIZATION, APP_NAME)
+        .ok_or(LauncherError::NoDataDir)?;
+    Ok(dirs.data_local_dir().to_path_buf())
+}
+
+/// Holds an exclusive advisory lock on a file in the data directory for the
+/// lifetime of the process, guaranteeing only one instance of a given app
+/// runs at a time. The lock is released automatically (dropping `File`
+/// releases the OS-level lock) when the process exits, including on crash.
+struct InstanceLock(#[allow(dead_code)] File);
+
+fn acquire_single_instance_lock(data_dir: &Path) -> Result<InstanceLock> {
+    let lock_path = data_dir.join("ruxius.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)?;
+
+    file.try_lock_exclusive().map_err(|_| {
+        log::warn!("Another instance is already running; exiting.");
+        LauncherError::AlreadyRunning
+    })?;
+
+    Ok(InstanceLock(file))
+}
+
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log::error!("PANIC: {info}");
+        default_hook(info);
+    }));
+}
+
+/// Hides the console window belonging to this process, if any. Used only
+/// when we're about to open a bundled app's WebView window, so a built app
+/// launched by double-clicking doesn't leave a console flashing on screen.
+/// A no-op if there's no console (e.g. none was allocated) or on
+/// non-Windows platforms.
+#[cfg(windows)]
+fn hide_console_window() {
+    use windows_sys::Win32::System::Console::GetConsoleWindow;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SW_HIDE, ShowWindow};
+
+    unsafe {
+        let window = GetConsoleWindow();
+        if window != 0 {
+            ShowWindow(window, SW_HIDE);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn hide_console_window() {}
+
+fn install_ctrlc_handler(php_server: Arc<Mutex<Option<PhpServer>>>) {
+    let result = ctrlc::set_handler(move || {
+        log::info!("Ctrl+C received; shutting down PHP server and exiting.");
+        if let Ok(mut guard) = php_server.lock() {
+            if let Some(mut server) = guard.take() {
+                server.shutdown();
+            }
+        }
+        std::process::exit(0);
+    });
+
+    if let Err(e) = result {
+        log::warn!("Failed to install Ctrl+C handler: {e}");
+    }
+}

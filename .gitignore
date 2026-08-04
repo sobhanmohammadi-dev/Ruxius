@@ -1,0 +1,19 @@
+# Rust build artifacts
+/target/
+
+# Cargo.lock
+# Uncomment this if you're building a library
+# Cargo.lock
+
+# IDE / Editor
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment / local config
+.env
+.env.*
+!.env.example
