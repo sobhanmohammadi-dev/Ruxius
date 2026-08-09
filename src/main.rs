@@ -13,6 +13,7 @@ mod extract;
 mod logger;
 mod payload;
 mod php;
+mod ui;
 mod version;
 mod webview;
 
@@ -31,11 +32,8 @@ const APP_QUALIFIER: &str = "com";
 const APP_ORGANIZATION: &str = "Ruxius";
 const APP_NAME: &str = "Ruxius";
 
-const WINDOW_TITLE: &str = "Ruxius";
-const WINDOW_WIDTH: u32 = 1400;
-const WINDOW_HEIGHT: u32 = 900;
-
 fn main() -> ExitCode {
+    ui::init();
     let cli = Cli::parse();
 
     let result = match cli.command {
@@ -44,15 +42,20 @@ fn main() -> ExitCode {
             app_path,
             php,
             output_path,
-        }) => run_build_command(&app_path, &php, &output_path),
+            title,
+            width,
+            height,
+            force,
+        }) => run_build_command(&app_path, &php, &output_path, title, width, height, force),
         Some(Command::Php { action }) => run_php_command(action),
+        Some(Command::Doctor) => run_doctor_command(),
     };
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             log::error!("Fatal error: {e:#}");
-            eprintln!("rux: {e:#}");
+            eprintln!("{} {e:#}", ui::red("rux:"));
             ExitCode::FAILURE
         }
     }
@@ -105,7 +108,8 @@ fn run_app(current_exe: &Path) -> Result<()> {
     let checksum_hex = payload_info.checksum_hex();
     let extract_root = data_dir.join("apps").join(&checksum_hex);
     let compressed_payload = payload::read_payload_bytes(current_exe, &payload_info)?;
-    let bundle_dir = extract::ensure_extracted(&extract_root, &compressed_payload, &checksum_hex)?;
+    let (bundle_dir, meta) =
+        extract::ensure_extracted(&extract_root, &compressed_payload, &checksum_hex)?;
 
     let php_server = PhpServer::start(&bundle_dir)?;
     let url = php_server.url();
@@ -129,7 +133,7 @@ fn run_app(current_exe: &Path) -> Result<()> {
         log::info!("Shutdown complete.");
     };
 
-    webview::run(&url, WINDOW_TITLE, WINDOW_WIDTH, WINDOW_HEIGHT, shutdown)?;
+    webview::run(&url, &meta.title, meta.width, meta.height, shutdown)?;
 
     // Unreachable in practice: tao's event loop takes over the process and
     // exits it directly. Kept for completeness / non-Windows testing.
@@ -140,7 +144,15 @@ fn run_app(current_exe: &Path) -> Result<()> {
 // `rux build <app-path> <php> <output-path>` — package, don't compile
 // ---------------------------------------------------------------------
 
-fn run_build_command(app_path: &Path, php: &str, output_path: &Path) -> Result<()> {
+fn run_build_command(
+    app_path: &Path,
+    php: &str,
+    output_path: &Path,
+    title: Option<String>,
+    width: u32,
+    height: u32,
+    force: bool,
+) -> Result<()> {
     if !app_path.is_dir() {
         return Err(LauncherError::Extraction(format!(
             "app path '{}' is not a directory",
@@ -163,26 +175,86 @@ fn run_build_command(app_path: &Path, php: &str, output_path: &Path) -> Result<(
         .parent()
         .ok_or_else(|| LauncherError::PhpStart("resolved PHP binary has no parent dir".into()))?;
 
-    println!("Packaging app:");
+    // Safety check: if something already exists at the output path and it
+    // doesn't look like a Ruxius build (i.e. it's some unrelated file), bail
+    // out instead of silently overwriting it. A previous Ruxius build is
+    // fine to overwrite freely — that's the normal rebuild path.
+    if output_path.exists() && !force {
+        let is_previous_build = payload::detect(output_path).ok().flatten().is_some();
+        if !is_previous_build {
+            return Err(LauncherError::Extraction(format!(
+                "'{}' already exists and doesn't look like a Ruxius build — refusing to \
+                 overwrite it. Pass --force if you're sure, or pick a different output path.",
+                output_path.display()
+            )));
+        }
+    }
+
+    let title = title.unwrap_or_else(|| {
+        app_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Ruxius App".to_string())
+    });
+    let meta = payload::BuildMeta {
+        title,
+        width,
+        height,
+    };
+
+    println!("{}", ui::bold("Packaging app"));
     println!("  app:    {}", app_path.display());
     println!("  php:    {} ({})", php, resolved.binary.display());
     if let Some(ext_dir) = &resolved.extension_dir {
         println!("  ext:    {}", ext_dir.display());
     } else {
-        println!("  ext:    (none found — extensions will use PHP's own defaults)");
+        println!(
+            "  ext:    {}",
+            ui::yellow("(none found — extensions will use PHP's own defaults)")
+        );
     }
-    println!("  output: {}", output_path.display());
-
-    let packed = payload::pack(php_dir, app_path)?;
     println!(
-        "Packed payload: {:.1} MiB",
-        packed.len() as f64 / (1024.0 * 1024.0)
+        "  window: \"{}\" {}x{}",
+        meta.title, meta.width, meta.height
+    );
+    println!("  output: {}", output_path.display());
+    println!();
+
+    let cache_dir = data_dir.join("cache").join("archives");
+    let spinner = ui::Spinner::start("Packing PHP + app archives");
+    let packed = match payload::pack(php_dir, app_path, &meta, &cache_dir) {
+        Ok(packed) => packed,
+        Err(e) => {
+            spinner.finish(false, "Packing failed");
+            return Err(e);
+        }
+    };
+    spinner.finish(
+        true,
+        &format!(
+            "Packed {:.1} MiB",
+            packed.len() as f64 / (1024.0 * 1024.0)
+        ),
     );
 
-    let current_exe = std::env::current_exe().map_err(LauncherError::Io)?;
-    payload::build_output(&current_exe, &packed, output_path)?;
+    if !force && payload::matches_existing_output(output_path, &packed) {
+        ui::info(&format!(
+            "{} is already up to date; nothing to rebuild. (use --force to rebuild anyway)",
+            output_path.display()
+        ));
+        return Ok(());
+    }
 
-    println!("Built {}", output_path.display());
+    let current_exe = std::env::current_exe().map_err(LauncherError::Io)?;
+    let write_spinner = ui::Spinner::start("Writing executable");
+    match payload::build_output(&current_exe, &packed, output_path) {
+        Ok(()) => write_spinner.finish(true, &format!("Built {}", output_path.display())),
+        Err(e) => {
+            write_spinner.finish(false, "Writing executable failed");
+            return Err(e);
+        }
+    }
+
     Ok(())
 }
 
@@ -207,15 +279,38 @@ fn run_php_command(action: PhpAction) -> Result<()> {
                 .php_versions
                 .insert(name.clone(), resolved.binary.clone());
             config.save(&data_dir).map_err(LauncherError::Other)?;
-            println!("Registered '{name}' -> {}", resolved.binary.display());
+            println!("{} '{name}' -> {}", ui::green("Registered"), resolved.binary.display());
         }
 
         PhpAction::Remove { name } => {
             if config.php_versions.remove(&name).is_some() {
                 config.save(&data_dir).map_err(LauncherError::Other)?;
-                println!("Removed '{name}'.");
+                println!("{} '{name}'.", ui::green("Removed"));
             } else {
-                println!("No PHP version named '{name}' is registered.");
+                ui::warn(&format!("No PHP version named '{name}' is registered."));
+            }
+        }
+
+        PhpAction::ClearCache => {
+            let cache_dir = data_dir.join("cache").join("archives");
+            match std::fs::read_dir(&cache_dir) {
+                Ok(entries) => {
+                    let mut count = 0u64;
+                    let mut bytes = 0u64;
+                    for entry in entries.flatten() {
+                        if let Ok(meta) = entry.metadata() {
+                            bytes += meta.len();
+                        }
+                        if std::fs::remove_file(entry.path()).is_ok() {
+                            count += 1;
+                        }
+                    }
+                    println!(
+                        "Cleared {count} cached archive(s) ({:.1} MiB).",
+                        bytes as f64 / (1024.0 * 1024.0)
+                    );
+                }
+                Err(_) => println!("No cached PHP archives to clear."),
             }
         }
 
@@ -224,21 +319,59 @@ fn run_php_command(action: PhpAction) -> Result<()> {
                 println!("No PHP versions registered yet. Add one with:");
                 println!("  rux php add <name> \"<path to php.exe>\"");
             } else {
-                println!("Registered PHP versions:");
-                for (name, path) in &config.php_versions {
-                    let status = match php::resolve_external_php(path) {
-                        Ok(_) => "ok",
-                        Err(_) => "MISSING",
-                    };
-                    println!("  {name:<12} {}  [{status}]", path.display());
+                println!("{}", ui::bold("Registered PHP versions:"));
+                let entries: Vec<(String, PathBuf)> = config
+                    .php_versions
+                    .iter()
+                    .map(|(name, path)| (name.clone(), path.clone()))
+                    .collect();
+
+                // Each entry means resolving the binary and (if valid)
+                // spawning `php -v` — independent work, so run it all
+                // concurrently instead of waiting on each process in turn.
+                let results = payload::parallel_map(&entries, |(name, path)| {
+                    let resolved = php::resolve_external_php(path).ok();
+                    let version = resolved
+                        .as_ref()
+                        .and_then(|r| php_version_string(&r.binary));
+                    (name.clone(), path.clone(), resolved.is_some(), version)
+                });
+
+                // Colored markers are printed as their own field, outside
+                // the width-padded columns — mixing ANSI escape codes into
+                // a `{:<width}` field would throw off the padding, since
+                // the invisible escape bytes count toward the width too.
+                for (name, path, valid, version) in results {
+                    if valid {
+                        let version = version.unwrap_or_else(|| "version unknown".to_string());
+                        println!(
+                            "  {} {name:<12} {version:<28} {}",
+                            ui::green("✓"),
+                            path.display()
+                        );
+                    } else {
+                        println!(
+                            "  {} {name:<12} {:<28} {}  {}",
+                            ui::red("✗"),
+                            "",
+                            path.display(),
+                            ui::red("[MISSING]")
+                        );
+                    }
                 }
             }
 
             let discovered = discover_php_installations();
             if !discovered.is_empty() {
                 println!("\nOther PHP installs found on this system:");
-                for path in discovered {
-                    println!("  {}", path.display());
+
+                let results = payload::parallel_map(&discovered, |path| {
+                    (path.clone(), php_version_string(path))
+                });
+
+                for (path, version) in results {
+                    let version = version.unwrap_or_else(|| "version unknown".to_string());
+                    println!("  {version:<28} {}", path.display());
                 }
                 println!("\nRegister one with: rux php add <name> \"<path>\"");
             }
@@ -246,6 +379,15 @@ fn run_php_command(action: PhpAction) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Runs `php -v` and extracts just the version line (e.g. "PHP 8.3.6
+/// (cli) ..."), for display in `rux php list`. Returns `None` if the
+/// binary can't be run or produces no output.
+fn php_version_string(binary: &Path) -> Option<String> {
+    let output = std::process::Command::new(binary).arg("-v").output().ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.lines().next().map(|line| line.trim().to_string())
 }
 
 /// Looks for PHP installs in common Windows locations (`C:\php*`,
@@ -274,14 +416,104 @@ fn discover_php_installations() -> Vec<PathBuf> {
         }
     }
 
-    let mut found = Vec::new();
-    for dir in candidates {
+    // Checking each candidate is a filesystem stat; with a long PATH this
+    // can be dozens of directories, so check them all concurrently instead
+    // of one at a time.
+    let checked = payload::parallel_map(&candidates, |dir| {
         let candidate = dir.join("php.exe");
-        if candidate.is_file() && !found.contains(&candidate) {
+        candidate.is_file().then_some(candidate)
+    });
+
+    let mut found = Vec::new();
+    for candidate in checked.into_iter().flatten() {
+        if !found.contains(&candidate) {
             found.push(candidate);
         }
     }
     found
+}
+
+// ---------------------------------------------------------------------
+// `rux doctor`
+// ---------------------------------------------------------------------
+
+fn run_doctor_command() -> Result<()> {
+    println!("{}", ui::bold(&format!("Ruxius {}", version::LAUNCHER_VERSION)));
+    println!();
+
+    match find_webview2_runtime() {
+        Some(version) => ui::ok(&format!("WebView2 Runtime found (version {version})")),
+        None => {
+            ui::error("WebView2 Runtime not found in any of the usual locations.");
+            println!("          Built apps need it to open their window. Get it from:");
+            println!("          {}", ui::cyan("https://developer.microsoft.com/microsoft-edge/webview2/"));
+        }
+    }
+
+    let data_dir = data_dir()?;
+    let config = AppConfig::load(&data_dir);
+    if config.php_versions.is_empty() {
+        ui::info("No PHP versions registered yet (rux php add <name> <path>).");
+    } else {
+        let mut ok = 0;
+        let mut missing = 0;
+        for path in config.php_versions.values() {
+            match php::resolve_external_php(path) {
+                Ok(_) => ok += 1,
+                Err(_) => missing += 1,
+            }
+        }
+        if missing == 0 {
+            ui::ok(&format!("{ok} registered PHP version(s), all valid."));
+        } else {
+            ui::warn(&format!(
+                "{ok} registered PHP version(s) valid, {missing} missing — check `rux php list`."
+            ));
+        }
+    }
+
+    let cache_dir = data_dir.join("cache").join("archives");
+    match std::fs::read_dir(&cache_dir) {
+        Ok(entries) => {
+            let count = entries.flatten().count();
+            ui::info(&format!("{count} cached archive(s) in {}", cache_dir.display()));
+        }
+        Err(_) => ui::info("No cached archives yet."),
+    }
+
+    Ok(())
+}
+
+/// Looks for an installed WebView2 Runtime in the locations the Evergreen
+/// installer actually uses (both per-machine and per-user), and returns
+/// its version folder name if found. Filesystem-based rather than a
+/// registry check, so it doesn't need an extra dependency just for this.
+fn find_webview2_runtime() -> Option<String> {
+    let mut candidates = vec![
+        PathBuf::from(r"C:\Program Files (x86)\Microsoft\EdgeWebView\Application"),
+        PathBuf::from(r"C:\Program Files\Microsoft\EdgeWebView\Application"),
+    ];
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        candidates.push(Path::new(&local_app_data).join(r"Microsoft\EdgeWebView\Application"));
+    }
+
+    for base in candidates {
+        let Ok(entries) = std::fs::read_dir(&base) else {
+            continue;
+        };
+        // Version folders look like "124.0.2478.97"; take the first one we see.
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                        return Some(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 // ---------------------------------------------------------------------

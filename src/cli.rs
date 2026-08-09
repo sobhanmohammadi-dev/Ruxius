@@ -34,6 +34,23 @@ pub enum Command {
 
         /// Where to write the resulting standalone executable.
         output_path: PathBuf,
+
+        /// Window title for the built app. Defaults to the app folder's name.
+        #[arg(long)]
+        title: Option<String>,
+
+        /// Window width in pixels.
+        #[arg(long, default_value_t = 1400)]
+        width: u32,
+
+        /// Window height in pixels.
+        #[arg(long, default_value_t = 900)]
+        height: u32,
+
+        /// Rebuild even if the output already matches what would be built
+        /// (by default, an up-to-date output is left untouched).
+        #[arg(long)]
+        force: bool,
     },
 
     /// Manage the registry of named PHP versions used by `rux build`.
@@ -41,6 +58,10 @@ pub enum Command {
         #[command(subcommand)]
         action: PhpAction,
     },
+
+    /// Check this machine for what `rux` needs to build and run apps
+    /// (currently: the WebView2 Runtime).
+    Doctor,
 }
 
 #[derive(Debug, Subcommand)]
@@ -62,4 +83,9 @@ pub enum PhpAction {
     /// List registered PHP versions, plus installs Ruxius can find
     /// automatically (common install locations and PATH).
     List,
+
+    /// Delete cached PHP/app archives built up by `rux build` (under
+    /// `%LOCALAPPDATA%\Ruxius\cache\archives\`), forcing the next build to
+    /// repack everything from scratch.
+    ClearCache,
 }

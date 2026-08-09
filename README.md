@@ -1,557 +1,308 @@
 # Ruxius
 
-**Package any PHP application into a single, portable Windows `.exe` — without recompiling PHP or rebuilding your app.**
+**Ruxius** packages a PHP web app into a standalone Windows desktop
+executable — without ever recompiling anything.
 
-Ruxius is a lightweight Rust-powered packager that turns a **PHP runtime + your application files** into a standalone Windows executable.
-
-Build `ruxius.exe` once. After that, packaging an application is just a file operation:
-
-```powershell
-rux build .\my-app php74 .\dist\MyApp.exe
-```
-
-That's it.
-
-The resulting `MyApp.exe` contains everything it needs to run your PHP application. On first launch, Ruxius extracts the bundled runtime, starts PHP's built-in web server, opens the application in a native **WebView2** window, and cleans everything up when the app closes.
-
-> **Build Ruxius once. Package PHP apps forever.**
-
----
-
-## ✨ Features
-
-* 📦 **Single-file distribution** — your PHP app ships as one `.exe`.
-* ⚡ **No compilation during packaging** — `rux build` only packages existing files.
-* 🐘 **Bring your own PHP runtime** — package any compatible Windows PHP build.
-* 🔌 **PHP extensions included** — the correct `ext/` directory is bundled with each PHP runtime.
-* 🖥️ **Native desktop window** — runs inside WebView2 instead of a browser.
-* 🚀 **Fast subsequent launches** — extracted files are cached and reused.
-* 🧩 **Multiple PHP versions** — register and switch between PHP installations.
-* 🛡️ **Process cleanup** — PHP is supervised and terminated when the app exits.
-* 🔒 **Isolated applications** — each packaged payload gets its own extraction directory.
-* 🪶 **No runtime dependency on Ruxius** — distributed applications don't need the builder.
-
----
-
-## How It Works
-
-Ruxius separates **building the packager** from **packaging an application**.
-
-You compile Ruxius itself only once:
+You compile `ruxius.exe` **once**. From then on, `rux` itself is the tool you
+use to stamp out apps: point it at a PHP install and a folder of PHP
+files, and it produces a new `.exe` with everything bundled in. Building an
+app is a packaging step, not a Rust build.
 
 ```powershell
-cargo build --release
+rux build .\my-app php74 MyApp.exe
 ```
 
-After that, `rux build` doesn't invoke Rust, Cargo, or any compiler.
+`MyApp.exe` is now a single, portable file. Running it:
 
-It simply:
+- extracts its bundled PHP + app files to `%LOCALAPPDATA%` (once — later
+  runs skip straight to launch),
+- starts PHP's built-in server on a free localhost port,
+- opens the app in a native **WebView2** window,
+- and cleans up after itself on close — no leftover PHP processes.
 
-1. Copies the Ruxius executable.
-2. Compresses your PHP runtime and application files.
-3. Appends the archive to the executable.
-4. Writes a small footer describing the embedded payload.
-5. Produces a new standalone `.exe`.
+## How it works
 
-Conceptually:
+`ruxius.exe` is a generic stub. `rux build` copies that stub and appends a
+compressed archive of your PHP install and app files to the end of the
+copy, followed by a small footer recording where the appended data starts.
+Any Ruxius executable checks for that footer on startup:
 
-```text
-┌───────────────────────┐
-│      ruxius.exe       │
-│                       │
-│ Generic executable    │
-│ + packaging logic     │
-└───────────┬───────────┘
-            │
-            │ rux build
-            │
-            ▼
-┌──────────────────────────────────┐
-│            MyApp.exe             │
-│                                  │
-│  [ Ruxius runtime ]              │
-│  [ PHP runtime ]                 │
-│  [ PHP extensions ]              │
-│  [ Application files ]           │
-│  [ Payload footer ]              │
-└────────────────┬─────────────────┘
-                 │
-                 │ Double-click
-                 ▼
-        ┌──────────────────┐
-        │ First launch     │
-        │                  │
-        │ Extract payload  │
-        │ Start PHP server │
-        │ Open WebView2    │
-        └────────┬─────────┘
-                 │
-                 ▼
-          Your PHP Desktop App
+- **No footer found** → this is the bare builder; running it with no
+  arguments just prints the normal `--help` output instead of opening an
+  empty window.
+- **Footer found** → this is a built app; running it (e.g. by double
+  clicking it) extracts and launches its bundled PHP + app — no commands
+  needed.
+
+```
+┌─────────────────┐   rux build app php74 out.exe   ┌────────────────────────┐
+│ ruxius.exe (stub,│ ────────────────────────────────▶│ out.exe                │
+│ nothing bundled) │  copies self + appends payload    │ [stub][php+app][footer]│
+└──────────────────┘                                  └───────────┬────────────┘
+                                                                    │ double-click
+                     first launch: extract once           ┌────────▼─────────────┐
+                     %LOCALAPPDATA%/Ruxius/apps/<hash>/    │ php.exe -S ... ◀▶ WebView2 │
+                                                            └───────────────────────────┘
 ```
 
-### Builder vs. Packaged Application
+No compiler, no `cargo build`, involved in producing `out.exe` — just file
+copying and archiving.
 
-Ruxius uses the same executable for both roles.
+## Getting started
 
-**No payload footer:**
-
-```text
-ruxius.exe
-    │
-    └── Builder / CLI
-```
-
-Running it displays the CLI help and allows commands such as:
-
-```powershell
-rux php list
-rux php add php83 "C:\php\php.exe"
-rux build .\my-app php83 .\MyApp.exe
-```
-
-**Payload footer present:**
-
-```text
-MyApp.exe
-    │
-    └── Packaged application
-```
-
-Double-clicking it automatically launches the bundled PHP application.
-
-No CLI command is required.
-
----
-
-# 🚀 Getting Started
-
-## 1. Build Ruxius
-
-You only need to do this when building or updating Ruxius itself.
+### 1. Build `ruxius.exe` (once)
 
 ```powershell
 cargo build --release
 ```
 
-The executable will be created at:
+Output: `target/release/ruxius.exe`. This is your packager — keep it around,
+you won't need to rebuild it again unless you're changing Ruxius itself.
 
-```text
-target/release/ruxius.exe
-```
-
-You can keep this executable and use it as your application packager.
-
-> **Important:** You do **not** need Rust or Cargo on machines where you use the finished `ruxius.exe` to package applications.
-
----
-
-## 2. Register PHP
-
-Register the PHP installations you want to package:
+### 2. Register a PHP install
 
 ```powershell
 rux php add php74 "C:\php\php7.4\php.exe"
 rux php add php83 "C:\php\php8.3\php.exe"
 ```
 
-List registered and automatically discovered PHP installations:
+Not sure what's on your machine? `rux php list` shows registered versions
+plus anything it can find automatically in common install locations and on
+`PATH`.
+
+By default this registry lives in `%LOCALAPPDATA%\Ruxius\config.json`. If
+you'd rather carry `ruxius.exe` around (a USB stick, a shared network
+drive, between machines) with its registry travelling with it instead of
+being tied to one PC, drop an empty `config.json` next to `ruxius.exe`:
 
 ```powershell
-rux php list
+'{}' | Out-File -Encoding utf8 .\config.json
 ```
 
-You can also skip registration entirely and provide a direct path to `php.exe` when building.
+From then on, `rux php add/remove` and `rux build` read and write that
+file instead of `%LOCALAPPDATA%`, for as long as it's sitting next to the
+executable.
 
----
-
-## 3. Package Your PHP Application
-
-Assuming your application looks like this:
-
-```text
-my-app/
-├── index.php
-├── assets/
-├── config/
-└── ...
-```
-
-Run:
+### 3. Package your app
 
 ```powershell
 rux build .\my-app php74 .\dist\MyApp.exe
 ```
 
-Where:
+- `.\my-app` — your PHP application's document root (an `index.php`
+  and whatever else it needs).
+- `php74` — the registered name from step 2 (a direct path to a `php.exe`
+  also works, if you'd rather skip registering one).
+- `.\dist\MyApp.exe` — where to write the finished, standalone executable.
 
-| Argument           | Description                     |
-| ------------------ | ------------------------------- |
-| `.\my-app`         | PHP application's document root |
-| `php74`            | Registered PHP runtime          |
-| `.\dist\MyApp.exe` | Output executable               |
-
-The result:
-
-```text
-dist/
-└── MyApp.exe
-```
-
-Run it directly:
-
-```powershell
-.\dist\MyApp.exe
-```
-
-Or simply double-click it.
-
----
-
-## 4. Try the Example
-
-Ruxius includes a minimal PHP application so you can test the complete workflow immediately.
+Try it against the bundled example first if you want to see it work end to
+end:
 
 ```powershell
 rux build .\examples\sample-app php74 .\dist\Sample.exe
-```
-
-Then:
-
-```powershell
 .\dist\Sample.exe
 ```
 
-You should see your PHP application open in its native WebView2 window.
+### 4. Ship it
 
----
+`MyApp.exe` is the whole deliverable — copy it anywhere, send it to
+someone, whatever. It doesn't depend on `ruxius.exe`, PHP being installed, or
+anything else on the target machine except the WebView2 runtime (present
+on most modern Windows installs already).
 
-# 📦 What's Inside the `.exe`?
+## CLI reference
 
-A packaged Ruxius application is essentially:
-
-```text
-┌─────────────────────────────┐
-│ Ruxius executable           │
-├─────────────────────────────┤
-│ Compressed PHP runtime      │
-├─────────────────────────────┤
-│ PHP extensions              │
-├─────────────────────────────┤
-│ Your PHP application        │
-├─────────────────────────────┤
-│ Payload metadata / footer   │
-└─────────────────────────────┘
 ```
+rux                               No app bundled: show this help (the builder)
+                                   App bundled: launch it (what double-click does)
 
-The payload is appended directly to a copy of the Ruxius executable.
+rux build <app> <php> <output>   Package <app>'s files + <php> into <output>.exe
+                                  <php> is a registered name or a path to php.exe
+  --title <TITLE>                 Window title (default: the app folder's name)
+  --width <PIXELS>                 Window width (default: 1400)
+  --height <PIXELS>                 Window height (default: 900)
+  --force                           Rebuild even if output is already up to date
 
-This means the final application is **one portable `.exe` file**.
+rux php add <name> <path>        Register a PHP install under <name>
+rux php remove <name>            Un-register it
+rux php list                     List registered + auto-discovered PHP installs,
+                                   each with its `php -v` version string
+rux php clear-cache              Delete cached PHP archives (see below)
 
-You don't need to distribute:
+rux doctor                       Check this machine for what rux needs
+                                   (WebView2 Runtime, registered PHP installs)
 
-* PHP
-* `php.exe`
-* PHP extension DLLs
-* your application directory
-* a separate launcher
-* Ruxius itself
-
-The target machine only needs the **WebView2 Runtime**, which is already installed on most modern Windows systems.
-
----
-
-# 🐘 PHP Extensions & `extension_dir`
-
-PHP extensions are ABI-specific.
-
-For example, an extension DLL built for PHP 8.3 cannot simply be reused with PHP 7.4.
-
-Ruxius handles this automatically.
-
-When running:
+rux --help                       Full help
+rux --version                    Print the version
+```
 
 ```powershell
-rux build .\my-app php83 .\MyApp.exe
+rux build .\my-app php74 .\dist\MyApp.exe --title "My App" --width 1200 --height 800
 ```
 
-Ruxius looks next to the selected `php.exe` for:
+`rux php add/remove/list` manage the version registry used by `rux build`
+(stored once in `%LOCALAPPDATA%\Ruxius\config.json`, shared across every
+app you build).
 
-```text
-ext/
+### Faster rebuilds
+
+A PHP install rarely changes, but it's usually the bulk of a payload's
+size — repacking and recompressing it on every single `rux build` would
+make iterating on your app files slow. So `rux build` fingerprints both
+the PHP directory and the app directory it's given (file names, sizes,
+modified times) and caches each one's compressed archive separately under
+`%LOCALAPPDATA%\Ruxius\cache\archives\`. Whichever side hasn't actually
+changed since the last build — usually PHP, but if you haven't touched
+your app files either, that gets skipped too — is reused as-is instead of
+being re-walked and re-compressed. If the resulting output would end up
+byte-for-byte identical to what's already there, `rux build` skips
+rewriting it entirely and tells you so (pass `--force` to rebuild anyway).
+If a cached archive ever seems stale or you just want to reclaim the disk
+space, `rux php clear-cache` wipes the whole cache — the next build just
+repacks everything from scratch.
+
+On top of the caching, packing itself is parallel and avoids redundant
+work at the algorithm level, not just the thread level:
+
+- **One directory walk, not two.** Fingerprinting a PHP install and
+  archiving it both need the same file list, so `rux build` walks the
+  directory tree once and shares that list between them, instead of
+  `walkdir`-ing it twice.
+- **Parallel `stat`s for fingerprinting.** The fingerprint only needs each
+  file's path, size, and modified time — no file contents — but that's
+  still one syscall per file. Those run concurrently across a chunked
+  thread pool (`payload::parallel_map`), then get folded into a single
+  `Sha256` sequentially, since hashing itself is cheap and a hasher can't
+  be parallelized across threads anyway.
+- **Parallel file reads for archiving.** On a cache miss, every file's
+  contents are read concurrently (I/O-bound work with real parallelism
+  headroom) into memory first; only the actual tar-writing — pure memory
+  copies at that point — happens on a single thread afterwards, since
+  `tar::Builder` is inherently a sequential stream.
+- **The PHP archive and the app archive are built on separate threads**
+  via `std::thread::scope`, so neither has to wait for the other.
+- **Compression itself is multithreaded** — zstd splits the work across
+  all available CPU cores — which matters most exactly when it's needed
+  most: a cache miss, where the PHP archive has to be compressed from
+  scratch.
+- **Extraction mirrors this**: on first run (or an update), the `php/` and
+  `app/` archives are decompressed and unpacked concurrently too.
+
+`rux php list` and PHP auto-discovery use the same `parallel_map` helper
+to fetch every `php -v` version string and check every `PATH` directory
+concurrently, instead of waiting on each process/stat in turn.
+
+### About `extension_dir`
+
+Different PHP builds compile their extension DLLs against that specific
+build's ABI — a `php_*.dll` from PHP 8.3 will not load in PHP 7.4, and vice
+versa. `rux build` looks for an `ext/` (or `extensions/`) folder next to
+whichever `php.exe` you point it at and packages it alongside the binary;
+the built app passes that folder explicitly via `-d extension_dir=...`
+when starting its server, so the right extensions always load for the PHP
+version actually bundled — never a stale directory left over from a
+different install.
+
+## Security
+
+- **Payload integrity.** Every built app's appended payload carries a
+  SHA-256 checksum in its footer; the payload is re-hashed and checked
+  against it before extraction, and again before use, so silent
+  corruption (bad copy, truncated download, disk error) is caught rather
+  than run.
+- **Safe extraction.** Extraction goes through the `tar` crate's own
+  unpacking, which rejects `..` path components and validates every
+  entry stays inside the destination directory — a malformed or
+  malicious archive can't write outside where it's supposed to.
+- **No network access, anywhere.** Ruxius doesn't download, phone home,
+  or fetch anything — every operation is local files in, local files (or
+  an appended `.exe`) out. There's no update check, no telemetry, nothing
+  to intercept.
+- **Won't clobber an unrelated file.** If `rux build`'s output path
+  already exists and doesn't look like a previous Ruxius build (i.e. it's
+  some other program entirely), the build refuses and tells you, instead
+  of silently overwriting it. Overwriting a *previous* Ruxius build (the
+  normal rebuild case) is unaffected; `--force` skips the check entirely
+  if you're certain.
+- **Single-instance locking** uses an OS-level exclusive file lock
+  (released automatically on exit, including a crash), so two copies of
+  the same built app can't race over the same port or extraction
+  directory.
+
+## UX
+
+- **Colored, readable output** — status lines are tagged and colored
+  (`ok` in green, `warn` in yellow, `error`/`[MISSING]` in red) throughout
+  `rux doctor`, `rux php list`, and `rux build`. Color respects
+  [`NO_COLOR`](https://no-color.org), turns itself off automatically when
+  output isn't a real terminal (e.g. piped to a file), and enables modern
+  Windows terminals' ANSI support itself rather than assuming it's on.
+  There's no dependency involved — it's a small internal module
+  (`src/ui.rs`) using plain ANSI codes, so there's no external crate
+  behavior to account for.
+- **Progress feedback that means something.** `rux build` shows a live
+  spinner while packing (falling back to a plain "...” line when color is
+  off) and reports how long each step actually took, so a fast cache-hit
+  rebuild and a slow first build are visibly different instead of both
+  just going quiet for a while.
+- **Clear errors.** Every failure path — a bad PHP path, a missing app
+  folder, an about-to-be-clobbered file — explains what went wrong and
+  what to do about it, not just that something failed.
+
+## Project structure
+
 ```
-
-or:
-
-```text
-extensions/
-```
-
-and bundles the appropriate directory with the PHP runtime.
-
-At runtime, the packaged application explicitly points PHP at its bundled extension directory:
-
-```text
--d extension_dir=<bundled-extension-directory>
-```
-
-This ensures that the application loads extensions belonging to the **exact PHP runtime it was packaged with**, rather than accidentally picking up extensions from another installation.
-
----
-
-# ⚡ Smart Extraction
-
-Ruxius doesn't unpack the application every time it launches.
-
-On first run, the payload is extracted to:
-
-```text
-%LOCALAPPDATA%\Ruxius\apps\<payload-checksum>\
-```
-
-On subsequent launches, Ruxius detects the existing extraction and starts the application directly.
-
-This makes repeated launches significantly faster.
-
-The payload checksum also provides isolation between applications and versions:
-
-```text
-%LOCALAPPDATA%\Ruxius\
-└── apps/
-    ├── 8f2a.../
-    │   └── App A
-    │
-    ├── 31bd.../
-    │   └── App B
-    │
-    └── c9e1.../
-        └── App A (new version)
-```
-
-Different applications — and different builds of the same application — won't overwrite each other.
-
----
-
-# 🖥️ Runtime Architecture
-
-When a packaged application starts, Ruxius performs roughly this sequence:
-
-```text
-MyApp.exe
-    │
-    ├── Detect embedded payload
-    │
-    ├── Calculate payload identity
-    │
-    ├── Extract if necessary
-    │
-    ├── Find a free localhost port
-    │
-    ├── Start PHP
-    │      └── php.exe -S 127.0.0.1:<port>
-    │
-    ├── Create native WebView2 window
-    │
-    ├── Navigate to local PHP application
-    │
-    └── On exit
-           ├── Close WebView2
-           └── Terminate PHP process
-```
-
-The result is a PHP application that behaves like a native desktop application while keeping the development model of a normal PHP web application.
-
----
-
-# 🧰 CLI Reference
-
-```text
-rux
-    No payload:
-        Show CLI help
-
-    Payload detected:
-        Launch packaged application
-
-
-rux build <app> <php> <output>
-    Package a PHP application into a standalone .exe
-
-    <app>:
-        Application document root
-
-    <php>:
-        Registered PHP name or direct path to php.exe
-
-    <output>:
-        Destination executable
-
-
-rux php add <name> <path>
-    Register a PHP installation
-
-
-rux php remove <name>
-    Remove a registered PHP installation
-
-
-rux php list
-    List registered and automatically discovered PHP installations
-
-
-rux --help
-    Show complete CLI help
-
-
-rux --version
-    Print the Ruxius version
-```
-
----
-
-# ⚙️ PHP Registry
-
-Registered PHP installations are stored globally at:
-
-```text
-%LOCALAPPDATA%\Ruxius\config.json
-```
-
-The registry is shared across all applications packaged with Ruxius.
-
-For example:
-
-```text
-PHP 7.4  → php74
-PHP 8.1  → php81
-PHP 8.3  → php83
-```
-
-You can then choose the runtime during packaging:
-
-```powershell
-rux build .\legacy-app php74 .\Legacy.exe
-rux build .\modern-app php83 .\Modern.exe
-```
-
----
-
-# 📁 Project Structure
-
-```text
 Ruxius/
 ├── Cargo.toml
 ├── examples/
-│   └── sample-app/
+│   └── sample-app/       # minimal PHP app to try `rux build` against
 │       └── index.php
-│
 └── src/
-    ├── main.rs        # CLI entry point and orchestration
-    ├── cli.rs         # clap CLI definition
-    ├── payload.rs     # Self-appending package format
-    ├── config.rs      # PHP registry and configuration
-    ├── extract.rs     # Payload extraction and caching
-    ├── php.rs         # PHP process management
-    ├── webview.rs     # Native WebView2 window
-    ├── version.rs     # Ruxius version information
-    ├── logger.rs      # File and stdout logging
-    └── error.rs       # Centralized error types
+    ├── main.rs             # CLI entry point + orchestration
+    ├── cli.rs                # clap CLI definition
+    ├── payload.rs              # self-appending package format (build/detect/read)
+    ├── config.rs                # persisted config: PHP registry + overrides
+    ├── extract.rs                 # first-run/update extraction logic
+    ├── php.rs                       # spawns & supervises the PHP server
+    ├── webview.rs                     # native WebView2 window (wry/tao)
+    ├── ui.rs                            # colored output + spinner (no external crate)
+    ├── version.rs                        # rux's own version string
+    ├── logger.rs                          # rotating file + stdout logging
+    └── error.rs                             # centralized error types
 ```
 
----
+## Requirements
 
-# 💻 Requirements
+- **Windows 10/11 x64** (WebView2 Runtime — preinstalled on most modern
+  Windows systems; run `rux doctor` to check).
+- **Rust** 1.85+ (edition 2024) with the MSVC toolchain (`rustup target
+  add x86_64-pc-windows-msvc`) — only needed to build `ruxius.exe` itself, not
+  to package apps with it.
+- A PHP build for Windows — official builds at
+  [windows.php.net/download](https://windows.php.net/download/) (grab the
+  **Non Thread Safe (NTS)** x64 zip and point `rux php add` at its
+  `php.exe`).
 
-### Target machines
+## Where things live at runtime
 
-* **Windows 10 / 11**
-* **x64**
-* **WebView2 Runtime**
+| What                          | Where                                                    |
+|--------------------------------|-----------------------------------------------------------|
+| Extracted app (per build)      | `%LOCALAPPDATA%\Ruxius\apps\<payload-checksum>\`        |
+| Cached php/app archives (build-time)| `%LOCALAPPDATA%\Ruxius\cache\archives\`             |
+| Config (registry, overrides)   | `%LOCALAPPDATA%\Ruxius\config.json`                     |
+| Logs                           | `%LOCALAPPDATA%\Ruxius\logs\ruxius-YYYY-MM-DD.log`      |
+| Single-instance lock           | `%LOCALAPPDATA%\Ruxius\ruxius.lock`                     |
 
-WebView2 is already present on most modern Windows installations.
+Each built app extracts to a folder named after its own payload checksum,
+so multiple Ruxius apps (or multiple versions of the same app) never
+collide, and re-running `rux build` with unchanged inputs reuses the
+existing extraction instead of re-copying files.
 
-### Building Ruxius
+## Contributing
 
-Only required when compiling Ruxius itself:
+Issues and pull requests are welcome. Please run `cargo fmt` and
+`cargo clippy` before submitting a PR.
 
-* **Rust 1.85+**
-* **Edition 2024**
-* **MSVC toolchain**
+## License
 
-Install the target with:
-
-```powershell
-rustup target add x86_64-pc-windows-msvc
-```
-
-### PHP
-
-A Windows PHP build is required for packaging.
-
-For best compatibility, use the official **x64 Non Thread Safe (NTS)** builds.
-
-Download PHP from:
-
-[windows.php.net](https://windows.php.net/download/)
-
-Then point Ruxius at the included `php.exe`:
-
-```powershell
-rux php add php83 "C:\php\php83\php.exe"
-```
-
----
-
-# 📍 Runtime Files
-
-Ruxius keeps its runtime data under:
-
-```text
-%LOCALAPPDATA%\Ruxius\
-```
-
-| Resource                     | Location                     |
-| ---------------------------- | ---------------------------- |
-| Extracted applications       | `apps\<payload-checksum>\`   |
-| PHP registry & configuration | `config.json`                |
-| Logs                         | `logs\ruxius-YYYY-MM-DD.log` |
-| Single-instance lock         | `ruxius.lock`                |
-
----
-
-# 🛠️ Development
-
-Clone the repository and build:
-
-```powershell
-cargo build --release
-```
-
-Before submitting a PR, please run:
-
-```powershell
-cargo fmt
-cargo clippy
-```
-
-Issues and pull requests are welcome.
-
----
-
-# 📄 License
-
-Ruxius is released under the **MIT License**.
-
-See [`LICENSE`](LICENSE) for the complete license text.
-
----
-
-<div align="center">
-
-**Ruxius**
-
-*PHP → Windows Desktop*
-
-Build once. Package anywhere.
-
-</div>
+MIT — see [LICENSE](LICENSE).
