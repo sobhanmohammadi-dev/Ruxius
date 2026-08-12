@@ -25,7 +25,12 @@ impl PhpServer {
     /// against `bundle_dir/app` using the PHP bundled at `bundle_dir/php`,
     /// hides its console window, and blocks (with a timeout) until the
     /// server is accepting connections.
-    pub fn start(bundle_dir: &Path) -> Result<Self> {
+    ///
+    /// `router` is the filename (relative to the docroot, e.g.
+    /// `"router.php"`) of a router script to pass to PHP's built-in server,
+    /// if the built app needs one — see `framework.rs`. Plain apps with no
+    /// detected framework pass `None` and behave exactly as before.
+    pub fn start(bundle_dir: &Path, router: Option<&str>) -> Result<Self> {
         let port = portpicker::pick_unused_port().ok_or(LauncherError::NoFreePort)?;
 
         let php_dir = bundle_dir.join("php");
@@ -38,10 +43,16 @@ impl PhpServer {
             bundle_dir.to_path_buf()
         };
 
+        // Only actually pass the router argument if the file is there —
+        // if it went missing somehow, falling back to no-router behavior
+        // is safer than pointing php.exe at a script that doesn't exist.
+        let router = router.filter(|r| docroot.join(r).is_file());
+
         log::info!(
-            "Starting PHP server: {} -S 127.0.0.1:{port} -t {}",
+            "Starting PHP server: {} -S 127.0.0.1:{port} -t {}{}",
             resolved.binary.display(),
-            docroot.display()
+            docroot.display(),
+            router.map(|r| format!(" {r}")).unwrap_or_default()
         );
         if let Some(ext_dir) = &resolved.extension_dir {
             log::info!("Using extension_dir: {}", ext_dir.display());
@@ -69,6 +80,12 @@ impl PhpServer {
             if let Some(ini_dir) = php_ini.parent() {
                 cmd.env("PHPRC", ini_dir);
             }
+        }
+
+        // The router script must be PHP's last positional argument, after
+        // every -S/-t/-d flag.
+        if let Some(router) = router {
+            cmd.arg(router);
         }
 
         #[cfg(windows)]

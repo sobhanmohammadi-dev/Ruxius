@@ -74,4 +74,18 @@ impl AppConfig {
             None => PathBuf::from(reference),
         }
     }
+
+    /// Where `.pack` files (see `pack.rs`) live: next to a portable config
+    /// if one is in use, so an archived install travels with the tool the
+    /// same way the registry does — otherwise under the app data dir.
+    pub fn packs_dir(data_dir: &Path) -> PathBuf {
+        if let Some(portable) = Self::portable_config_path() {
+            if portable.is_file() {
+                if let Some(dir) = portable.parent() {
+                    return dir.join("packs");
+                }
+            }
+        }
+        data_dir.join("packs")
+    }
 }

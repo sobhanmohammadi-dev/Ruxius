@@ -9,10 +9,14 @@
 mod cli;
 mod config;
 mod error;
+mod ext;
 mod extract;
+mod framework;
 mod logger;
+mod pack;
 mod payload;
 mod php;
+mod tui;
 mod ui;
 mod version;
 mod webview;
@@ -49,6 +53,7 @@ fn main() -> ExitCode {
         }) => run_build_command(&app_path, &php, &output_path, title, width, height, force),
         Some(Command::Php { action }) => run_php_command(action),
         Some(Command::Doctor) => run_doctor_command(),
+        Some(Command::Tui) => tui::run(),
     };
 
     match result {
@@ -111,7 +116,7 @@ fn run_app(current_exe: &Path) -> Result<()> {
     let (bundle_dir, meta) =
         extract::ensure_extracted(&extract_root, &compressed_payload, &checksum_hex)?;
 
-    let php_server = PhpServer::start(&bundle_dir)?;
+    let php_server = PhpServer::start(&bundle_dir, meta.router.as_deref())?;
     let url = php_server.url();
     log::info!("PHP backend ready at {url}");
 
@@ -175,6 +180,40 @@ fn run_build_command(
         .parent()
         .ok_or_else(|| LauncherError::PhpStart("resolved PHP binary has no parent dir".into()))?;
 
+    // If `php` names a registered version and it's been archived with
+    // `rux php archive`, use that .pack directly and skip walking/hashing/
+    // compressing the PHP directory entirely — the fast path this whole
+    // feature exists for. A corrupt pack is a hard error rather than a
+    // silent fallback, since silently ignoring it could mask real
+    // tampering or disk corruption.
+    let packs_dir = AppConfig::packs_dir(&data_dir);
+    let php_source = if config.php_versions.contains_key(php) {
+        match pack::read(php, &packs_dir)? {
+            Some(bytes) => {
+                ui::info(&format!("Using archived pack for '{php}' (skipping directory scan)"));
+                payload::PhpArchiveSource::Prebuilt(bytes)
+            }
+            None => payload::PhpArchiveSource::Directory(php_dir),
+        }
+    } else {
+        payload::PhpArchiveSource::Directory(php_dir)
+    };
+
+    // Detect Laravel/Symfony/other public/-rooted frameworks: PHP's
+    // built-in server has no rewrite rules of its own, so a framework app
+    // needs both the right docroot (public/, not the project root) and a
+    // router script to fall back to the front controller for anything
+    // that isn't a real static file — otherwise only the homepage works.
+    let detection = framework::detect(app_path);
+    let app_extra_files: Vec<(String, Vec<u8>)> = if detection.needs_router {
+        vec![framework::router_file()]
+    } else {
+        Vec::new()
+    };
+    for warning in framework::compatibility_warnings(app_path, &detection) {
+        ui::warn(&warning);
+    }
+
     // Safety check: if something already exists at the output path and it
     // doesn't look like a Ruxius build (i.e. it's some unrelated file), bail
     // out instead of silently overwriting it. A previous Ruxius build is
@@ -196,33 +235,33 @@ fn run_build_command(
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Ruxius App".to_string())
     });
-    let meta = payload::BuildMeta {
-        title,
-        width,
-        height,
-    };
+    let router = detection.needs_router.then(|| framework::ROUTER_FILENAME.to_string());
+    let meta = payload::BuildMeta::new(title, width, height, router);
 
     println!("{}", ui::bold("Packaging app"));
-    println!("  app:    {}", app_path.display());
-    println!("  php:    {} ({})", php, resolved.binary.display());
+    println!("  app:       {}", app_path.display());
+    if detection.kind != framework::Kind::Plain {
+        println!("  framework: {} (serving from {})", detection.kind.label(), detection.docroot.display());
+    }
+    println!("  php:       {} ({})", php, resolved.binary.display());
     if let Some(ext_dir) = &resolved.extension_dir {
-        println!("  ext:    {}", ext_dir.display());
+        println!("  ext:       {}", ext_dir.display());
     } else {
         println!(
-            "  ext:    {}",
+            "  ext:       {}",
             ui::yellow("(none found — extensions will use PHP's own defaults)")
         );
     }
     println!(
-        "  window: \"{}\" {}x{}",
+        "  window:    \"{}\" {}x{}",
         meta.title, meta.width, meta.height
     );
-    println!("  output: {}", output_path.display());
+    println!("  output:    {}", output_path.display());
     println!();
 
     let cache_dir = data_dir.join("cache").join("archives");
     let spinner = ui::Spinner::start("Packing PHP + app archives");
-    let packed = match payload::pack(php_dir, app_path, &meta, &cache_dir) {
+    let packed = match payload::pack(php_source, &detection.docroot, &app_extra_files, &meta, &cache_dir) {
         Ok(packed) => packed,
         Err(e) => {
             spinner.finish(false, "Packing failed");
@@ -314,6 +353,49 @@ fn run_php_command(action: PhpAction) -> Result<()> {
             }
         }
 
+        PhpAction::Archive => {
+            if config.php_versions.is_empty() {
+                println!("No PHP versions registered yet. Add one with:");
+                println!("  rux php add <name> \"<path to php.exe>\"");
+                return Ok(());
+            }
+
+            let packs_dir = AppConfig::packs_dir(&data_dir);
+            // Each archive job already saturates all CPU cores internally
+            // (parallel file reads + multithreaded zstd compression), so
+            // archiving is done one PHP version at a time rather than
+            // launching them all concurrently — running several such
+            // CPU-bound jobs at once wouldn't be any faster, just more
+            // contended, and this way progress per version is easy to follow.
+            for (name, path) in &config.php_versions {
+                let resolved = match php::resolve_external_php(path) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        ui::warn(&format!("Skipping '{name}': {e}"));
+                        continue;
+                    }
+                };
+                let php_dir = resolved.binary.parent().unwrap_or(path);
+                let spinner = ui::Spinner::start(format!("Archiving '{name}'"));
+                match pack::archive(name, php_dir, &packs_dir) {
+                    Ok(pack_path) => {
+                        let size = std::fs::metadata(&pack_path).map(|m| m.len()).unwrap_or(0);
+                        spinner.finish(
+                            true,
+                            &format!(
+                                "'{name}' -> {} ({:.1} MiB)",
+                                pack_path.display(),
+                                size as f64 / (1024.0 * 1024.0)
+                            ),
+                        );
+                    }
+                    Err(e) => spinner.finish(false, &format!("'{name}' failed: {e}")),
+                }
+            }
+        }
+
+        PhpAction::Ext { action } => run_ext_command(action, &config)?,
+
         PhpAction::List => {
             if config.php_versions.is_empty() {
                 println!("No PHP versions registered yet. Add one with:");
@@ -390,6 +472,99 @@ fn php_version_string(binary: &Path) -> Option<String> {
     stdout.lines().next().map(|line| line.trim().to_string())
 }
 
+// ---------------------------------------------------------------------
+// `rux php ext ...`
+// ---------------------------------------------------------------------
+
+fn run_ext_command(action: cli::ExtAction, config: &AppConfig) -> Result<()> {
+    match action {
+        cli::ExtAction::List { php } => {
+            let (php_ini, ext_dir, binary) = resolve_php_ini(config, &php)?;
+            println!("{}", ui::bold(&format!("php: {}", binary.display())));
+            println!("{}", ui::dim(&format!("ini: {}", php_ini.display())));
+            println!();
+
+            let configured = ext::list_configured(&php_ini)?;
+            if configured.is_empty() {
+                println!("No extension= lines found in this php.ini.");
+            } else {
+                for e in &configured {
+                    let marker = if e.enabled { ui::green("✓") } else { ui::dim("○") };
+                    let kind = if e.zend { " (zend)" } else { "" };
+                    println!("  {marker} {}{kind}", e.name);
+                }
+            }
+
+            if let Some(ext_dir) = &ext_dir {
+                let available = ext::list_available_unconfigured(&php_ini, ext_dir)?;
+                if !available.is_empty() {
+                    println!("\n{}", ui::dim("Available but not configured:"));
+                    for a in available {
+                        println!("  {} {}", ui::dim("·"), a.name);
+                    }
+                }
+            }
+        }
+
+        cli::ExtAction::Enable { php, extension } => {
+            let (php_ini, ext_dir, _) = resolve_php_ini(config, &php)?;
+            let outcome = ext::set_enabled(&php_ini, ext_dir.as_deref(), &extension, true)?;
+            report_toggle_outcome(&extension, true, outcome);
+        }
+
+        cli::ExtAction::Disable { php, extension } => {
+            let (php_ini, ext_dir, _) = resolve_php_ini(config, &php)?;
+            let outcome = ext::set_enabled(&php_ini, ext_dir.as_deref(), &extension, false)?;
+            report_toggle_outcome(&extension, false, outcome);
+        }
+    }
+    Ok(())
+}
+
+/// Resolves a `php` CLI argument (registered name or path) down to its
+/// php.ini, extension directory (if any), and the binary itself — the
+/// trio every `rux php ext` subcommand needs.
+fn resolve_php_ini(
+    config: &AppConfig,
+    php: &str,
+) -> Result<(PathBuf, Option<PathBuf>, PathBuf)> {
+    let path = config.resolve_php_reference(php);
+    let resolved = php::resolve_external_php(&path).map_err(|e| {
+        LauncherError::PhpStart(format!(
+            "couldn't resolve PHP '{php}' (looked at '{}'): {e}",
+            path.display()
+        ))
+    })?;
+    let php_ini = resolved.php_ini.ok_or_else(|| {
+        LauncherError::Extraction(format!(
+            "no php.ini found next to {}",
+            resolved.binary.display()
+        ))
+    })?;
+    Ok((php_ini, resolved.extension_dir, resolved.binary))
+}
+
+fn report_toggle_outcome(extension: &str, enabling: bool, outcome: ext::ToggleOutcome) {
+    match outcome {
+        ext::ToggleOutcome::Changed => {
+            let verb = if enabling { "enabled" } else { "disabled" };
+            println!("{} '{extension}' {verb}.", ui::green("✓"));
+        }
+        ext::ToggleOutcome::AddedNewLine => {
+            println!("{} '{extension}' enabled (added new line to php.ini).", ui::green("✓"));
+        }
+        ext::ToggleOutcome::AlreadyInThatState => {
+            let state = if enabling { "enabled" } else { "disabled" };
+            ui::info(&format!("'{extension}' was already {state}."));
+        }
+        ext::ToggleOutcome::NotAvailable => {
+            ui::error(&format!(
+                "'{extension}' isn't configured and no matching DLL was found in ext/."
+            ));
+        }
+    }
+}
+
 /// Looks for PHP installs in common Windows locations (`C:\php*`,
 /// `C:\Program Files\PHP*`) and on PATH, purely as a convenience for
 /// `rux php list`. This is best-effort discovery, not exhaustive.
@@ -441,7 +616,40 @@ fn run_doctor_command() -> Result<()> {
     println!("{}", ui::bold(&format!("Ruxius {}", version::LAUNCHER_VERSION)));
     println!();
 
-    match find_webview2_runtime() {
+    let data_dir = data_dir()?;
+    let config = AppConfig::load(&data_dir);
+    let cache_dir = data_dir.join("cache").join("archives");
+    let packs_dir = AppConfig::packs_dir(&data_dir);
+
+    // These four checks don't depend on each other and are all filesystem
+    // I/O (directory scans, `stat` calls) rather than CPU work, so running
+    // them concurrently shortens `rux doctor`'s wall-clock time instead of
+    // paying for each one back to back.
+    let (webview2, php_status, cache_count, pack_count) = std::thread::scope(|scope| {
+        let webview2 = scope.spawn(find_webview2_runtime);
+        let php_status = scope.spawn(|| {
+            let mut ok = 0;
+            let mut missing = 0;
+            for path in config.php_versions.values() {
+                match php::resolve_external_php(path) {
+                    Ok(_) => ok += 1,
+                    Err(_) => missing += 1,
+                }
+            }
+            (ok, missing)
+        });
+        let cache_count = scope.spawn(|| std::fs::read_dir(&cache_dir).map(|d| d.flatten().count()).ok());
+        let pack_count = scope.spawn(|| pack::list_names(&packs_dir).len());
+
+        (
+            webview2.join().unwrap_or(None),
+            php_status.join().unwrap_or((0, 0)),
+            cache_count.join().unwrap_or(None),
+            pack_count.join().unwrap_or(0),
+        )
+    });
+
+    match webview2 {
         Some(version) => ui::ok(&format!("WebView2 Runtime found (version {version})")),
         None => {
             ui::error("WebView2 Runtime not found in any of the usual locations.");
@@ -450,36 +658,22 @@ fn run_doctor_command() -> Result<()> {
         }
     }
 
-    let data_dir = data_dir()?;
-    let config = AppConfig::load(&data_dir);
+    let (ok, missing) = php_status;
     if config.php_versions.is_empty() {
         ui::info("No PHP versions registered yet (rux php add <name> <path>).");
+    } else if missing == 0 {
+        ui::ok(&format!("{ok} registered PHP version(s), all valid."));
     } else {
-        let mut ok = 0;
-        let mut missing = 0;
-        for path in config.php_versions.values() {
-            match php::resolve_external_php(path) {
-                Ok(_) => ok += 1,
-                Err(_) => missing += 1,
-            }
-        }
-        if missing == 0 {
-            ui::ok(&format!("{ok} registered PHP version(s), all valid."));
-        } else {
-            ui::warn(&format!(
-                "{ok} registered PHP version(s) valid, {missing} missing — check `rux php list`."
-            ));
-        }
+        ui::warn(&format!(
+            "{ok} registered PHP version(s) valid, {missing} missing — check `rux php list`."
+        ));
     }
 
-    let cache_dir = data_dir.join("cache").join("archives");
-    match std::fs::read_dir(&cache_dir) {
-        Ok(entries) => {
-            let count = entries.flatten().count();
-            ui::info(&format!("{count} cached archive(s) in {}", cache_dir.display()));
-        }
-        Err(_) => ui::info("No cached archives yet."),
+    match cache_count {
+        Some(count) => ui::info(&format!("{count} cached build archive(s) in {}", cache_dir.display())),
+        None => ui::info("No cached build archives yet."),
     }
+    ui::info(&format!("{pack_count} .pack file(s) in {}", packs_dir.display()));
 
     Ok(())
 }

@@ -41,6 +41,12 @@ pub struct BuildMeta {
     pub title: String,
     pub width: u32,
     pub height: u32,
+    /// Filename (relative to the app's docroot) of a router script to pass
+    /// to PHP's built-in server, e.g. `Some("router.php".to_string())` for
+    /// a detected Laravel/Symfony app. `None` for a plain app — same
+    /// behavior as before this field existed.
+    #[serde(default)]
+    pub router: Option<String>,
 }
 
 impl Default for BuildMeta {
@@ -49,6 +55,34 @@ impl Default for BuildMeta {
             title: "Ruxius App".to_string(),
             width: 1400,
             height: 900,
+            router: None,
+        }
+    }
+}
+
+impl BuildMeta {
+    /// Builds a `BuildMeta`, sanitizing whatever was passed as `--title`:
+    /// control characters (including newlines) are stripped and the result
+    /// is capped at a sane length, since this string ends up passed
+    /// straight to the OS window-title API at launch. `width`/`height` are
+    /// clamped to a sane range so a typo (or a deliberately huge value)
+    /// can't hand the OS a request for an absurd or degenerate window.
+    pub fn new(title: impl Into<String>, width: u32, height: u32, router: Option<String>) -> Self {
+        let cleaned: String = title
+            .into()
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect::<String>()
+            .trim()
+            .chars()
+            .take(120)
+            .collect();
+
+        Self {
+            title: if cleaned.is_empty() { "Ruxius App".to_string() } else { cleaned },
+            width: width.clamp(320, 7680),
+            height: height.clamp(240, 4320),
+            router,
         }
     }
 }
@@ -197,10 +231,27 @@ pub fn unpack_archive_into(archive: &[u8], dest: &Path) -> Result<()> {
 /// app, or both) hasn't actually changed since the last build. Both are
 /// checked and, if needed, rebuilt concurrently on separate threads, and
 /// each is compressed using all available CPU cores.
-pub fn pack(php_dir: &Path, app_dir: &Path, meta: &BuildMeta, cache_dir: &Path) -> Result<Vec<u8>> {
+///
+/// `php_source` can also be [`PhpArchiveSource::Prebuilt`] — a
+/// already-compressed archive read straight from a `.pack` file (see
+/// `pack.rs`), skipping the walk/fingerprint/compress cycle for PHP
+/// entirely. That's a deliberate trust-the-user tradeoff: a `.pack` is
+/// only as fresh as the last `rux php archive` run, unlike the
+/// fingerprint-based cache, which always re-checks.
+pub fn pack(
+    php_source: PhpArchiveSource,
+    app_dir: &Path,
+    app_extra_files: &[(String, Vec<u8>)],
+    meta: &BuildMeta,
+    cache_dir: &Path,
+) -> Result<Vec<u8>> {
     let (php_result, app_result) = thread::scope(|scope| {
-        let php_handle = scope.spawn(|| cached_or_build_archive("php", php_dir, cache_dir));
-        let app_handle = scope.spawn(|| cached_or_build_archive("app", app_dir, cache_dir));
+        let php_handle = scope.spawn(move || match php_source {
+            PhpArchiveSource::Directory(dir) => cached_or_build_archive("php", dir, &[], cache_dir),
+            PhpArchiveSource::Prebuilt(bytes) => Ok(bytes),
+        });
+        let app_handle =
+            scope.spawn(|| cached_or_build_archive("app", app_dir, app_extra_files, cache_dir));
         (php_handle.join(), app_handle.join())
     });
 
@@ -222,13 +273,22 @@ pub fn pack(php_dir: &Path, app_dir: &Path, meta: &BuildMeta, cache_dir: &Path) 
     Ok(out)
 }
 
+/// Where `pack()` should get the PHP-side archive from.
+pub enum PhpArchiveSource<'a> {
+    /// Walk this directory, using the fingerprint cache as usual.
+    Directory(&'a Path),
+    /// Already-compressed archive bytes (from a `.pack` file) — used
+    /// as-is, no directory walk or freshness check.
+    Prebuilt(Vec<u8>),
+}
+
 /// Returns a cached compressed archive of `dir` if one exists for its
 /// current fingerprint, otherwise builds it fresh and caches the result.
 /// `kind` ("php" or "app") just namespaces the cache file so the two don't
 /// collide.
 /// One entry from a directory walk, kept around so both fingerprinting and
 /// archiving can share a single traversal instead of walking twice.
-struct DirEntry {
+pub(crate) struct DirEntry {
     abs_path: PathBuf,
     rel_path: PathBuf,
     is_dir: bool,
@@ -239,7 +299,7 @@ struct DirEntry {
 /// Both `cached_or_build_archive`'s fingerprint check and, on a cache miss,
 /// the archive build itself run off this single list rather than each
 /// re-walking the directory tree independently.
-fn walk_sorted(dir: &Path) -> Vec<DirEntry> {
+pub(crate) fn walk_sorted(dir: &Path) -> Vec<DirEntry> {
     let mut entries: Vec<DirEntry> = walkdir::WalkDir::new(dir)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -293,7 +353,12 @@ where
     })
 }
 
-fn cached_or_build_archive(kind: &str, dir: &Path, cache_dir: &Path) -> Result<Vec<u8>> {
+fn cached_or_build_archive(
+    kind: &str,
+    dir: &Path,
+    extra: &[(String, Vec<u8>)],
+    cache_dir: &Path,
+) -> Result<Vec<u8>> {
     if !dir.is_dir() {
         return Err(LauncherError::Archive(format!(
             "{} is not a directory",
@@ -302,7 +367,7 @@ fn cached_or_build_archive(kind: &str, dir: &Path, cache_dir: &Path) -> Result<V
     }
 
     let entries = walk_sorted(dir);
-    let fingerprint = fingerprint_entries(&entries);
+    let fingerprint = fingerprint_entries(&entries, extra);
     let cache_path = cache_dir.join(format!("{kind}-{fingerprint}.tar.zst"));
 
     if let Ok(cached) = std::fs::read(&cache_path) {
@@ -311,7 +376,7 @@ fn cached_or_build_archive(kind: &str, dir: &Path, cache_dir: &Path) -> Result<V
     }
 
     log::info!("No cached {kind} archive for {fingerprint}; packing fresh.");
-    let archive = tar_zstd_entries(&entries)?;
+    let archive = tar_zstd_entries(&entries, extra)?;
 
     if let Err(e) = std::fs::create_dir_all(cache_dir) {
         log::warn!("Couldn't create {kind} archive cache dir: {e}");
@@ -323,14 +388,18 @@ fn cached_or_build_archive(kind: &str, dir: &Path, cache_dir: &Path) -> Result<V
 }
 
 /// A cheap fingerprint of a directory's contents (relative path, size, and
-/// modified time of every file), used to decide whether a cached archive
-/// is still valid — much faster than hashing file contents, and good
-/// enough since we only need to detect "this directory changed".
+/// modified time of every file) plus any extra virtual files, used to
+/// decide whether a cached archive is still valid — much faster than
+/// hashing file contents, and good enough since we only need to detect
+/// "this directory (or its injected extras) changed". Folding `extra`
+/// into the same hash means a change to Ruxius's bundled router script
+/// (say, across a Ruxius version bump) naturally invalidates any cached
+/// archive that used the old one, with no separate cache-busting needed.
 /// The `stat` call for each file is the actual cost here (a syscall per
 /// file), so those run in parallel; the final hash fold is cheap enough to
 /// stay single-threaded (and needs to, since `Sha256` is a sequential
 /// state machine).
-fn fingerprint_entries(entries: &[DirEntry]) -> String {
+fn fingerprint_entries(entries: &[DirEntry], extra: &[(String, Vec<u8>)]) -> String {
     let files: Vec<&DirEntry> = entries.iter().filter(|e| !e.is_dir).collect();
 
     let stats: Vec<Option<(u64, u64)>> = parallel_map(&files, |entry| {
@@ -352,16 +421,23 @@ fn fingerprint_entries(entries: &[DirEntry]) -> String {
             hasher.update(mtime.to_le_bytes());
         }
     }
+    for (name, bytes) in extra {
+        hasher.update(name.as_bytes());
+        hasher.update(bytes);
+    }
 
     hex::encode(hasher.finalize())[..24].to_string()
 }
 
-/// Builds a zstd-compressed tar from an already-walked entry list. File
-/// contents are read in parallel across threads (the actual I/O-bound
-/// work); the tar itself is still assembled on a single thread afterwards,
-/// since `tar::Builder` writes to one sequential stream — but by then
-/// every read has already completed, so that step is just memory copies.
-fn tar_zstd_entries(entries: &[DirEntry]) -> Result<Vec<u8>> {
+/// Builds a zstd-compressed tar from an already-walked entry list, plus
+/// any extra in-memory files appended at the end (used to inject a
+/// framework router script without ever writing it into the user's actual
+/// project directory). File contents are read in parallel across threads
+/// (the actual I/O-bound work); the tar itself is still assembled on a
+/// single thread afterwards, since `tar::Builder` writes to one sequential
+/// stream — but by then every read has already completed, so that step is
+/// just memory copies.
+pub(crate) fn tar_zstd_entries(entries: &[DirEntry], extra: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
     let files: Vec<&DirEntry> = entries.iter().filter(|e| !e.is_dir).collect();
     let contents: Vec<std::io::Result<Vec<u8>>> =
         parallel_map(&files, |entry| std::fs::read(&entry.abs_path));
@@ -395,6 +471,16 @@ fn tar_zstd_entries(entries: &[DirEntry]) -> Result<Vec<u8>> {
                     LauncherError::Archive(format!("adding file {:?}: {e}", entry.abs_path))
                 })?;
         }
+    }
+
+    for (name, bytes) in extra {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        builder
+            .append_data(&mut header, name, bytes.as_slice())
+            .map_err(|e| LauncherError::Archive(format!("adding {name}: {e}")))?;
     }
 
     let tar_bytes = builder
@@ -489,7 +575,7 @@ pub fn matches_existing_output(output_path: &Path, payload: &[u8]) -> bool {
     }
 }
 
-fn sha256(data: &[u8]) -> [u8; 32] {
+pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(data);
     hasher.finalize().into()
