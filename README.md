@@ -1,5 +1,7 @@
 # Ruxius
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/sobhanmohammadi-dev/Ruxius)
+
 **Ruxius** packages a PHP web app into a standalone Windows desktop
 executable — without ever recompiling anything.
 
