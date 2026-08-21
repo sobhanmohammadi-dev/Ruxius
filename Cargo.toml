@@ -1,11 +1,11 @@
 [package]
 name = "ruxius"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2024"
 description = "Ruxius — packages a PHP app into a standalone Windows executable"
 authors = ["Ruxius"]
 license = "MIT"
-repository = "https://github.com/sobhanmohammadi-dev/ruxius"
+repository = "https://github.com/sobhanmohammadi-dev/Ruxius"
 
 [[bin]]
 name = "ruxius"
@@ -50,3 +50,4 @@ windows-sys = { version = "0.52", features = [
     "Win32_System_Threading",
     "Win32_Security",
 ] }
+winres-edit = "0.2"

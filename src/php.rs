@@ -30,7 +30,24 @@ impl PhpServer {
     /// `"router.php"`) of a router script to pass to PHP's built-in server,
     /// if the built app needs one — see `framework.rs`. Plain apps with no
     /// detected framework pass `None` and behave exactly as before.
-    pub fn start(bundle_dir: &Path, router: Option<&str>) -> Result<Self> {
+    ///
+    /// `log_path`, if given, captures PHP's stderr there instead of
+    /// discarding it — that's where PHP's built-in server writes its
+    /// per-request access log plus any warnings/errors/notices, so this is
+    /// what `rux tui`'s Logs tab and `rux logs` tail.
+    ///
+    /// `ini_overrides` are extra php.ini directives from `--php-ini
+    /// key=value` at build time, each passed straight through as a
+    /// `-d key=value` flag — command-line `-d` already takes precedence
+    /// over php.ini, so there's no need to touch the packaged php.ini
+    /// itself. Malformed entries (no `=`) are skipped with a warning
+    /// rather than passed to php.exe as-is.
+    pub fn start(
+        bundle_dir: &Path,
+        router: Option<&str>,
+        log_path: Option<&Path>,
+        ini_overrides: &[String],
+    ) -> Result<Self> {
         let port = portpicker::pick_unused_port().ok_or(LauncherError::NoFreePort)?;
 
         let php_dir = bundle_dir.join("php");
@@ -58,6 +75,26 @@ impl PhpServer {
             log::info!("Using extension_dir: {}", ext_dir.display());
         }
 
+        let stderr_target = match log_path {
+            Some(path) => {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                // Append rather than truncate: a built app can be launched
+                // many times, and losing the previous run's errors the
+                // moment you relaunch to reproduce something would defeat
+                // the point of having a log at all.
+                match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    Ok(file) => Stdio::from(file),
+                    Err(e) => {
+                        log::warn!("Couldn't open PHP log file {}: {e}", path.display());
+                        Stdio::null()
+                    }
+                }
+            }
+            None => Stdio::null(),
+        };
+
         let mut cmd = Command::new(&resolved.binary);
         cmd.arg("-S")
             .arg(format!("127.0.0.1:{port}"))
@@ -65,7 +102,7 @@ impl PhpServer {
             .arg(&docroot)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(stderr_target);
 
         // Explicitly setting extension_dir on the command line is what makes
         // switching between PHP versions/installs actually work: each PHP
@@ -74,6 +111,14 @@ impl PhpServer {
         // php.exe we're running.
         if let Some(ext_dir) = &resolved.extension_dir {
             cmd.arg("-d").arg(format!("extension_dir={}", ext_dir.display()));
+        }
+
+        for entry in ini_overrides {
+            if entry.contains('=') {
+                cmd.arg("-d").arg(entry);
+            } else {
+                log::warn!("Ignoring malformed --php-ini entry (expected key=value): {entry}");
+            }
         }
 
         if let Some(php_ini) = &resolved.php_ini {
@@ -170,7 +215,7 @@ pub fn resolve_external_php(path: &Path) -> Result<ResolvedPhp> {
                 fallback
             } else {
                 return Err(LauncherError::PhpStart(format!(
-                    "no php.exe found in {}",
+                    "no php.exe or php binary found in {}",
                     path.display()
                 )));
             }

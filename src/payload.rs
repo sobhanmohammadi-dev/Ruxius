@@ -47,6 +47,13 @@ pub struct BuildMeta {
     /// behavior as before this field existed.
     #[serde(default)]
     pub router: Option<String>,
+    /// Extra php.ini directives set via `--php-ini key=value` at build
+    /// time, applied as `-d key=value` flags when PHP's built-in server
+    /// starts. The packaged php.ini itself is never modified — `-d`
+    /// flags already take precedence over it, which is simpler and safer
+    /// than rewriting an ini file we don't have to.
+    #[serde(default)]
+    pub php_ini_overrides: Vec<String>,
 }
 
 impl Default for BuildMeta {
@@ -56,6 +63,7 @@ impl Default for BuildMeta {
             width: 1400,
             height: 900,
             router: None,
+            php_ini_overrides: Vec::new(),
         }
     }
 }
@@ -67,7 +75,13 @@ impl BuildMeta {
     /// straight to the OS window-title API at launch. `width`/`height` are
     /// clamped to a sane range so a typo (or a deliberately huge value)
     /// can't hand the OS a request for an absurd or degenerate window.
-    pub fn new(title: impl Into<String>, width: u32, height: u32, router: Option<String>) -> Self {
+    pub fn new(
+        title: impl Into<String>,
+        width: u32,
+        height: u32,
+        router: Option<String>,
+        php_ini_overrides: Vec<String>,
+    ) -> Self {
         let cleaned: String = title
             .into()
             .chars()
@@ -83,6 +97,7 @@ impl BuildMeta {
             width: width.clamp(320, 7680),
             height: height.clamp(240, 4320),
             router,
+            php_ini_overrides,
         }
     }
 }
@@ -399,7 +414,7 @@ fn cached_or_build_archive(
 /// file), so those run in parallel; the final hash fold is cheap enough to
 /// stay single-threaded (and needs to, since `Sha256` is a sequential
 /// state machine).
-fn fingerprint_entries(entries: &[DirEntry], extra: &[(String, Vec<u8>)]) -> String {
+pub(crate) fn fingerprint_entries(entries: &[DirEntry], extra: &[(String, Vec<u8>)]) -> String {
     let files: Vec<&DirEntry> = entries.iter().filter(|e| !e.is_dir).collect();
 
     let stats: Vec<Option<(u64, u64)>> = parallel_map(&files, |entry| {

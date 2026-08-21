@@ -1,19 +1,12 @@
-# Rust build artifacts
-/target/
+/target
+*.pdb
 
-# Cargo.lock
-# Uncomment this if you're building a library
-# Cargo.lock
-
-# IDE / Editor
-.idea/
+# Editor / OS
 .vscode/
-
-# OS files
+.idea/
+*.swp
 .DS_Store
 Thumbs.db
 
-# Environment / local config
-.env
-.env.*
-!.env.example
+# Local build output (apps produced with `rux build`)
+/dist/

@@ -1,13 +1,13 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-/// Ruxius — packages a PHP app into a standalone Windows executable and
+/// Ruxius — packages a PHP app into a standalone desktop executable and
 /// launches apps that have already been packaged.
 ///
-/// The compiled tool itself (`ruxius.exe`) is used from the command line as
+/// The compiled tool itself (`ruxius`) is used from the command line as
 /// `rux`. Running it bare with no subcommand shows this help. Apps you
-/// build with `rux build` don't take any commands at all — just double
-/// click the resulting .exe to run it.
+/// build with `rux build` don't take any commands at all — just run the
+/// resulting executable directly.
 #[derive(Debug, Parser)]
 #[command(name = "rux", version, about, long_about = None)]
 pub struct Cli {
@@ -51,6 +51,25 @@ pub enum Command {
         /// (by default, an up-to-date output is left untouched).
         #[arg(long)]
         force: bool,
+
+        /// After the first build, keep watching <app-path> and rebuild
+        /// automatically whenever its files change. Runs until Ctrl+C.
+        #[arg(long)]
+        watch: bool,
+
+        /// Path to a .ico file to use as the built app's icon.
+        /// Windows-only (patches the .exe's PE resources after packaging;
+        /// there's no equivalent resource to patch on other platforms).
+        #[arg(long)]
+        icon: Option<PathBuf>,
+
+        /// Extra php.ini directive, as "key=value" (e.g.
+        /// --php-ini memory_limit=512M). Repeatable. Applied on top of
+        /// whatever the bundled php.ini already has, via -d flags passed
+        /// to the built-in server — the original php.ini is never
+        /// modified.
+        #[arg(long = "php-ini", value_name = "KEY=VALUE")]
+        php_ini: Vec<String>,
     },
 
     /// Manage the registry of named PHP versions used by `rux build`.
@@ -60,12 +79,47 @@ pub enum Command {
     },
 
     /// Check this machine for what `rux` needs to build and run apps
-    /// (currently: the WebView2 Runtime).
+    /// (currently: a WebView backend — WebView2/WKWebView/WebKitGTK).
     Doctor,
+
+    /// Guided first-time setup: checks this machine, helps you register a
+    /// PHP install, and optionally writes a minimal sample app so there's
+    /// something to build right away.
+    Init,
 
     /// Open an interactive terminal dashboard for managing PHP versions,
     /// archives, and extensions.
     Tui,
+
+    /// Tail the most recently active built app's PHP log (stderr: access
+    /// log plus warnings/errors/notices) live, until Ctrl+C.
+    Logs {
+        /// How many existing lines to show before tailing new ones.
+        #[arg(long, default_value_t = 20)]
+        lines: usize,
+    },
+
+    /// Export or import the PHP version registry as a single JSON file,
+    /// for sharing between machines.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigAction {
+    /// Write the current PHP registry to a JSON file.
+    Export {
+        /// Where to write it, e.g. "ruxius-config.json".
+        path: PathBuf,
+    },
+
+    /// Load a PHP registry from a JSON file, replacing entries with the
+    /// same name (anything else already registered is left alone).
+    Import {
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
