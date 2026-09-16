@@ -40,16 +40,7 @@ Any Ruxius executable checks for that footer on startup:
   clicking it) extracts and launches its bundled PHP + app — no commands
   needed.
 
-```
-┌─────────────────┐   rux build app php74 out.exe   ┌────────────────────────┐
-│ ruxius.exe (stub,│ ────────────────────────────────▶│ out.exe                │
-│ nothing bundled) │  copies self + appends payload    │ [stub][php+app][footer]│
-└──────────────────┘                                  └───────────┬────────────┘
-                                                                    │ double-click
-                     first launch: extract once           ┌────────▼─────────────┐
-                     %LOCALAPPDATA%/Ruxius/apps/<hash>/    │ php.exe -S ...  ◀▶ WebView   │
-                                                            └───────────────────────────┘
-```
+![How ruxius can work?](docs/img/how-ruxius-can-work.png)
 
 No compiler, no `cargo build`, involved in producing `out.exe` — just file
 copying and archiving.
