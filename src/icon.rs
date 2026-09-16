@@ -168,3 +168,120 @@ pub fn embed_icon(_base_exe: &Path, _ico_path: &Path, _output: &Path) -> Result<
             .into(),
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a minimal but well-formed single-image `.ico` file, by hand,
+    /// straight from the format spec — not by calling any code from this
+    /// module — so this is a genuine independent check of `parse_ico`,
+    /// not a tautology that would pass even if the parser had the wrong
+    /// field offsets.
+    fn sample_ico_bytes() -> Vec<u8> {
+        let image_data: Vec<u8> = vec![0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44];
+        let offset: u32 = 6 + 16; // ICONDIR header + one ICONDIRENTRY
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // type = icon
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // count = 1
+
+        bytes.push(16); // width
+        bytes.push(16); // height
+        bytes.push(0); // color count
+        bytes.push(0); // reserved
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // planes
+        bytes.extend_from_slice(&32u16.to_le_bytes()); // bit count
+        bytes.extend_from_slice(&(image_data.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&offset.to_le_bytes());
+
+        bytes.extend_from_slice(&image_data);
+        bytes
+    }
+
+    #[test]
+    fn parses_minimal_valid_ico() {
+        let bytes = sample_ico_bytes();
+        let images = parse_ico(&bytes).expect("well-formed ICO should parse");
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].width, 16);
+        assert_eq!(images[0].height, 16);
+        assert_eq!(images[0].color_count, 0);
+        assert_eq!(images[0].planes, 1);
+        assert_eq!(images[0].bit_count, 32);
+        assert_eq!(images[0].data, vec![0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44]);
+    }
+
+    #[test]
+    fn rejects_wrong_header() {
+        // Right length, but not the ICO magic (reserved=0, type=1).
+        let bytes = vec![1, 2, 3, 4, 5, 6];
+        assert!(parse_ico(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_file() {
+        assert!(parse_ico(&[]).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_images() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // count = 0
+        assert!(parse_ico(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_truncated_directory_table() {
+        // Header claims one entry, but no entry bytes actually follow.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        assert!(parse_ico(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_image_data_past_end_of_file() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.push(16);
+        bytes.push(16);
+        bytes.push(0);
+        bytes.push(0);
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&32u16.to_le_bytes());
+        bytes.extend_from_slice(&100u32.to_le_bytes()); // claims far more data than exists
+        bytes.extend_from_slice(&22u32.to_le_bytes());
+        assert!(parse_ico(&bytes).is_err());
+    }
+
+    #[test]
+    fn group_icon_data_has_the_shape_windows_expects() {
+        let images = parse_ico(&sample_ico_bytes()).unwrap();
+        let ids = vec![101u16];
+        let group = build_group_icon_data(&images, &ids);
+
+        // GRPICONDIR header (6 bytes) + one GRPICONDIRENTRY (14 bytes).
+        assert_eq!(group.len(), 6 + 14);
+        assert_eq!(&group[0..2], &0u16.to_le_bytes(), "reserved");
+        assert_eq!(&group[2..4], &1u16.to_le_bytes(), "type = icon");
+        assert_eq!(&group[4..6], &1u16.to_le_bytes(), "image count");
+        assert_eq!(group[6], 16, "width");
+        assert_eq!(group[7], 16, "height");
+        assert_eq!(
+            &group[12..16],
+            &(images[0].data.len() as u32).to_le_bytes(),
+            "bytesInRes"
+        );
+        // This is the field that actually differs from a plain ICONDIRENTRY:
+        // a resource ID here, not a byte offset into a file.
+        assert_eq!(&group[16..18], &101u16.to_le_bytes(), "resource id");
+    }
+}

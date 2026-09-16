@@ -595,3 +595,210 @@ pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
     hasher.update(data);
     hasher.finalize().into()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha256_matches_known_test_vectors() {
+        assert_eq!(hex::encode(sha256(b"")), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        assert_eq!(hex::encode(sha256(b"abc")), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
+    #[test]
+    fn detect_returns_none_for_a_plain_file_with_no_footer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.exe");
+        std::fs::write(&path, b"just some ordinary bytes, not a Ruxius build").unwrap();
+
+        assert!(detect(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn detect_returns_none_for_a_file_too_small_to_hold_a_footer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny.exe");
+        std::fs::write(&path, b"short").unwrap();
+
+        assert!(detect(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn build_output_roundtrips_through_detect_and_read_payload_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("stub.exe");
+        let output = dir.path().join("built.exe");
+        std::fs::write(&stub, b"pretend this is a compiled ruxius.exe stub").unwrap();
+
+        let payload = b"pretend this is a compressed php+app payload".to_vec();
+        build_output(&stub, &payload, &output).unwrap();
+
+        let info = detect(&output).unwrap().expect("built output should have a payload");
+        assert_eq!(info.checksum, sha256(&payload));
+
+        let read_back = read_payload_bytes(&output, &info).unwrap();
+        assert_eq!(read_back, payload);
+    }
+
+    #[test]
+    fn build_output_on_top_of_a_previous_build_strips_the_old_payload() {
+        // Rebuilding from a *stub that's itself already a built app*
+        // (chained build) must use only the original stub bytes, not the
+        // old payload — otherwise every rebuild would grow the file by
+        // re-appending on top of the previous payload forever.
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("stub.exe");
+        let first = dir.path().join("first.exe");
+        let second = dir.path().join("second.exe");
+        std::fs::write(&stub, b"the actual stub bytes").unwrap();
+
+        build_output(&stub, b"first payload", &first).unwrap();
+        build_output(&first, b"second, different payload", &second).unwrap();
+
+        let stub_len = std::fs::metadata(&stub).unwrap().len();
+        let info = detect(&second).unwrap().unwrap();
+        assert_eq!(info.offset, stub_len, "payload should start right after the original stub");
+
+        let read_back = read_payload_bytes(&second, &info).unwrap();
+        assert_eq!(read_back, b"second, different payload");
+    }
+
+    #[test]
+    fn read_payload_bytes_rejects_a_corrupted_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("stub.exe");
+        let output = dir.path().join("built.exe");
+        std::fs::write(&stub, b"stub bytes").unwrap();
+        build_output(&stub, b"original payload", &output).unwrap();
+
+        // Flip a byte inside the payload region without touching the
+        // footer, simulating disk/transfer corruption. The footer is the
+        // last FOOTER_LEN bytes, so stay comfortably clear of it.
+        let mut bytes = std::fs::read(&output).unwrap();
+        let corrupt_at = bytes.len() - FOOTER_LEN as usize - 5;
+        bytes[corrupt_at] ^= 0xFF;
+        std::fs::write(&output, &bytes).unwrap();
+
+        let info = detect(&output).unwrap().unwrap();
+        assert!(read_payload_bytes(&output, &info).is_err());
+    }
+
+    #[test]
+    fn matches_existing_output_true_only_for_identical_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("stub.exe");
+        let output = dir.path().join("built.exe");
+        std::fs::write(&stub, b"stub bytes").unwrap();
+        build_output(&stub, b"some payload", &output).unwrap();
+
+        assert!(matches_existing_output(&output, b"some payload"));
+        assert!(!matches_existing_output(&output, b"a different payload"));
+    }
+
+    #[test]
+    fn matches_existing_output_false_when_file_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.exe");
+        assert!(!matches_existing_output(&missing, b"anything"));
+    }
+
+    #[test]
+    fn fingerprint_changes_when_a_file_changes_and_stays_stable_otherwise() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+
+        let before = fingerprint_entries(&walk_sorted(dir.path()), &[]);
+        let same_again = fingerprint_entries(&walk_sorted(dir.path()), &[]);
+        assert_eq!(before, same_again, "fingerprint should be stable when nothing changed");
+
+        std::fs::write(dir.path().join("a.txt"), b"hello, but longer now").unwrap();
+        let after = fingerprint_entries(&walk_sorted(dir.path()), &[]);
+        assert_ne!(before, after, "fingerprint should change when file contents change");
+    }
+
+    #[test]
+    fn fingerprint_changes_with_extra_files_even_if_directory_is_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+        let entries = walk_sorted(dir.path());
+
+        let without_extra = fingerprint_entries(&entries, &[]);
+        let with_extra = fingerprint_entries(
+            &entries,
+            &[("router.php".to_string(), b"<?php".to_vec())],
+        );
+        assert_ne!(
+            without_extra, with_extra,
+            "injecting a router script must invalidate any cache keyed on the old fingerprint"
+        );
+    }
+
+    #[test]
+    fn pack_and_unpack_roundtrip_php_and_app_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let php_dir = dir.path().join("php");
+        let app_dir = dir.path().join("app");
+        let cache_dir = dir.path().join("cache");
+        std::fs::create_dir_all(&php_dir).unwrap();
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(php_dir.join("php.exe"), b"pretend php binary").unwrap();
+        std::fs::write(app_dir.join("index.php"), b"<?php echo 'hi';").unwrap();
+
+        let meta = BuildMeta::new("Test App", 800, 600, None, Vec::new());
+        let packed = pack(
+            PhpArchiveSource::Directory(&php_dir),
+            &app_dir,
+            &[],
+            &meta,
+            &cache_dir,
+        )
+        .unwrap();
+
+        let unpacked = unpack(&packed).unwrap();
+        assert_eq!(unpacked.meta.title, "Test App");
+        assert_eq!(unpacked.meta.width, 800);
+
+        let php_out = dir.path().join("extracted-php");
+        let app_out = dir.path().join("extracted-app");
+        std::fs::create_dir_all(&php_out).unwrap();
+        std::fs::create_dir_all(&app_out).unwrap();
+        unpack_archive_into(unpacked.php_archive, &php_out).unwrap();
+        unpack_archive_into(unpacked.app_archive, &app_out).unwrap();
+
+        assert_eq!(std::fs::read(php_out.join("php.exe")).unwrap(), b"pretend php binary");
+        assert_eq!(std::fs::read(app_out.join("index.php")).unwrap(), b"<?php echo 'hi';");
+    }
+
+    #[test]
+    fn pack_reuses_a_prebuilt_php_archive_without_touching_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_dir = dir.path().join("app");
+        let cache_dir = dir.path().join("cache");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("index.php"), b"<?php").unwrap();
+
+        // Build a "prebuilt" archive from a real directory first (this is
+        // exactly what a .pack file's contents look like once read back),
+        // then delete that directory — pack() must pass the prebuilt
+        // bytes through as-is, never fall back to walking a directory.
+        let fake_php_source = dir.path().join("fake-php-source");
+        std::fs::create_dir_all(&fake_php_source).unwrap();
+        std::fs::write(fake_php_source.join("php.exe"), b"prebuilt php").unwrap();
+        let fake_prebuilt = tar_zstd_entries(&walk_sorted(&fake_php_source), &[]).unwrap();
+        std::fs::remove_dir_all(&fake_php_source).unwrap();
+
+        let meta = BuildMeta::default();
+        let packed = pack(
+            PhpArchiveSource::Prebuilt(fake_prebuilt.clone()),
+            &app_dir,
+            &[],
+            &meta,
+            &cache_dir,
+        )
+        .unwrap();
+
+        let unpacked = unpack(&packed).unwrap();
+        assert_eq!(unpacked.php_archive, fake_prebuilt.as_slice());
+    }
+}

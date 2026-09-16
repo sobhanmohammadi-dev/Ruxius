@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows (build, test, lint)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        continue-on-error: true
+        run: cargo clippy --all-targets --all-features
+
+      - name: Build (debug)
+        run: cargo build --verbose
+
+      - name: Run tests
+        run: cargo test --verbose
+
+      - name: Build (release)
+        run: cargo build --release --verbose
+
+      - name: Upload built ruxius.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: ruxius-windows-x64
+          path: target/release/ruxius.exe
+          if-no-files-found: error
+
+  # Windows is the only platform this project actually ships for — the
+  # WebView2-based bundling story is Windows-specific end to end. These
+  # jobs exist to catch outright compile breaks in the parts of the code
+  # that are meant to be platform-agnostic (PHP archiving, ext.rs parsing,
+  # framework detection, etc.), not to claim verified cross-platform
+  # support. Failures here are worth looking at, but they don't block the
+  # Windows build/release.
+  cross-platform-best-effort:
+    name: ${{ matrix.os }} (best effort, non-blocking)
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install WebKitGTK build deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --verbose
+
+      - name: Run tests
+        run: cargo test --verbose

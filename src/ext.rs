@@ -255,3 +255,179 @@ pub fn set_enabled(
     write_lines(php_ini, &lines, uses_crlf)?;
     Ok(ToggleOutcome::AddedNewLine)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_ini(dir: &Path, content: &str) -> std::path::PathBuf {
+        let path = dir.join("php.ini");
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn normalize_strips_prefix_suffix_and_case() {
+        assert_eq!(normalize("curl"), "curl");
+        assert_eq!(normalize("php_curl"), "curl");
+        assert_eq!(normalize("php_curl.dll"), "curl");
+        assert_eq!(normalize("PHP_CURL.DLL"), "curl");
+        assert_eq!(normalize("  curl  "), "curl");
+        assert_eq!(normalize("mbstring.so"), "mbstring");
+    }
+
+    #[test]
+    fn safe_extension_names_accepted() {
+        assert!(is_safe_extension_name("curl"));
+        assert!(is_safe_extension_name("php_curl.dll"));
+        assert!(is_safe_extension_name("some-ext_1.2"));
+    }
+
+    #[test]
+    fn unsafe_extension_names_rejected() {
+        assert!(!is_safe_extension_name(""));
+        assert!(!is_safe_extension_name("curl\nzend_extension=evil"));
+        assert!(!is_safe_extension_name("curl;evil=1"));
+        assert!(!is_safe_extension_name("curl][section]"));
+        assert!(!is_safe_extension_name(&"a".repeat(200)));
+    }
+
+    #[test]
+    fn set_enabled_rejects_unsafe_names_before_touching_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini = write_ini(dir.path(), "extension=curl\n");
+        let result = set_enabled(&ini, None, "curl\nevil=1", true);
+        assert!(result.is_err());
+        // The file must be untouched — an injection attempt should never
+        // even reach the read/modify/write path.
+        assert_eq!(std::fs::read_to_string(&ini).unwrap(), "extension=curl\n");
+    }
+
+    #[test]
+    fn list_configured_parses_enabled_disabled_and_zend_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini = write_ini(
+            dir.path(),
+            "; a comment\nextension=curl\n;extension=gd\nzend_extension=opcache\n",
+        );
+
+        let configured = list_configured(&ini).unwrap();
+        assert_eq!(configured.len(), 3);
+
+        let curl = configured.iter().find(|e| e.name == "curl").unwrap();
+        assert!(curl.enabled);
+        assert!(!curl.zend);
+
+        let gd = configured.iter().find(|e| e.name == "gd").unwrap();
+        assert!(!gd.enabled);
+
+        let opcache = configured.iter().find(|e| e.name == "opcache").unwrap();
+        assert!(opcache.enabled);
+        assert!(opcache.zend);
+    }
+
+    #[test]
+    fn set_enabled_disables_an_enabled_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini = write_ini(dir.path(), "extension=curl\n");
+
+        let outcome = set_enabled(&ini, None, "curl", false).unwrap();
+        assert_eq!(outcome, ToggleOutcome::Changed);
+
+        let content = std::fs::read_to_string(&ini).unwrap();
+        assert!(content.contains(";extension=curl"));
+    }
+
+    #[test]
+    fn set_enabled_enables_a_disabled_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini = write_ini(dir.path(), ";extension=curl\n");
+
+        let outcome = set_enabled(&ini, None, "curl", true).unwrap();
+        assert_eq!(outcome, ToggleOutcome::Changed);
+
+        let content = std::fs::read_to_string(&ini).unwrap();
+        assert!(content.lines().any(|l| l == "extension=curl"));
+    }
+
+    #[test]
+    fn set_enabled_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini = write_ini(dir.path(), "extension=curl\n");
+
+        let outcome = set_enabled(&ini, None, "curl", true).unwrap();
+        assert_eq!(outcome, ToggleOutcome::AlreadyInThatState);
+    }
+
+    #[test]
+    fn set_enabled_adds_a_new_line_when_dll_is_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini = write_ini(dir.path(), "");
+        let ext_dir = dir.path().join("ext");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(ext_dir.join("php_curl.dll"), b"").unwrap();
+
+        let outcome = set_enabled(&ini, Some(&ext_dir), "curl", true).unwrap();
+        assert_eq!(outcome, ToggleOutcome::AddedNewLine);
+
+        let content = std::fs::read_to_string(&ini).unwrap();
+        assert!(content.contains("extension=curl"));
+    }
+
+    #[test]
+    fn set_enabled_refuses_to_add_a_line_with_no_matching_dll() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini = write_ini(dir.path(), "");
+        let ext_dir = dir.path().join("ext");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        // No php_curl.dll in here.
+
+        let outcome = set_enabled(&ini, Some(&ext_dir), "curl", true).unwrap();
+        assert_eq!(outcome, ToggleOutcome::NotAvailable);
+        assert_eq!(std::fs::read_to_string(&ini).unwrap(), "");
+    }
+
+    #[test]
+    fn list_available_unconfigured_excludes_already_configured_extensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini = write_ini(dir.path(), "extension=curl\n");
+        let ext_dir = dir.path().join("ext");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(ext_dir.join("php_curl.dll"), b"").unwrap();
+        std::fs::write(ext_dir.join("php_gd.dll"), b"").unwrap();
+
+        let available = list_available_unconfigured(&ini, &ext_dir).unwrap();
+        let names: Vec<&str> = available.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["gd"]); // curl is already configured, so excluded
+    }
+
+    #[test]
+    fn backup_is_created_once_and_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini = write_ini(dir.path(), "extension=curl\n");
+        let backup = ini.with_extension("ini.orig");
+
+        set_enabled(&ini, None, "curl", false).unwrap();
+        assert!(backup.is_file());
+        let first_backup_content = std::fs::read_to_string(&backup).unwrap();
+        assert_eq!(first_backup_content, "extension=curl\n");
+
+        // A second edit must not touch the backup again, even though the
+        // live file has changed since.
+        set_enabled(&ini, None, "curl", true).unwrap();
+        let second_backup_content = std::fs::read_to_string(&backup).unwrap();
+        assert_eq!(second_backup_content, first_backup_content);
+    }
+
+    #[test]
+    fn write_lines_preserves_crlf_line_endings() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini = write_ini(dir.path(), "extension=curl\r\nextension=gd\r\n");
+
+        set_enabled(&ini, None, "curl", false).unwrap();
+
+        let content = std::fs::read_to_string(&ini).unwrap();
+        assert!(content.contains("\r\n"), "should keep CRLF line endings");
+        assert!(!content.replace("\r\n", "").contains('\n'), "should not introduce bare LF");
+    }
+}

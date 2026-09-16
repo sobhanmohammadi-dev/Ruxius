@@ -141,3 +141,116 @@ pub fn compatibility_warnings(app_path: &Path, detection: &Detection) -> Vec<Str
 
     warnings
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_app_with_no_public_dir_is_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.php"), "<?php echo 'hi';").unwrap();
+
+        let detection = detect(dir.path());
+        assert_eq!(detection.kind, Kind::Plain);
+        assert_eq!(detection.docroot, dir.path());
+        assert!(!detection.needs_router);
+    }
+
+    #[test]
+    fn public_folder_alone_without_index_php_is_still_plain() {
+        // A flat app that merely happens to have a `public/` folder of
+        // static assets shouldn't be misdetected as a framework.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("public")).unwrap();
+        std::fs::write(dir.path().join("public").join("style.css"), "").unwrap();
+
+        let detection = detect(dir.path());
+        assert_eq!(detection.kind, Kind::Plain);
+    }
+
+    #[test]
+    fn laravel_detected_via_artisan_plus_public_index() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("public")).unwrap();
+        std::fs::write(dir.path().join("public").join("index.php"), "").unwrap();
+        std::fs::write(dir.path().join("artisan"), "").unwrap();
+
+        let detection = detect(dir.path());
+        assert_eq!(detection.kind, Kind::Laravel);
+        assert_eq!(detection.docroot, dir.path().join("public"));
+        assert!(detection.needs_router);
+    }
+
+    #[test]
+    fn symfony_detected_via_bin_console_plus_public_index() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("public")).unwrap();
+        std::fs::write(dir.path().join("public").join("index.php"), "").unwrap();
+        std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+        std::fs::write(dir.path().join("bin").join("console"), "").unwrap();
+
+        let detection = detect(dir.path());
+        assert_eq!(detection.kind, Kind::Symfony);
+        assert!(detection.needs_router);
+    }
+
+    #[test]
+    fn generic_public_layout_without_artisan_or_console() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("public")).unwrap();
+        std::fs::write(dir.path().join("public").join("index.php"), "").unwrap();
+
+        let detection = detect(dir.path());
+        assert_eq!(detection.kind, Kind::GenericPublic);
+        assert!(detection.needs_router);
+    }
+
+    #[test]
+    fn router_file_is_named_consistently() {
+        let (name, bytes) = router_file();
+        assert_eq!(name, ROUTER_FILENAME);
+        assert!(!bytes.is_empty());
+        assert!(String::from_utf8(bytes).unwrap().starts_with("<?php"));
+    }
+
+    #[test]
+    fn plain_apps_get_no_compatibility_warnings() {
+        let dir = tempfile::tempdir().unwrap();
+        let detection = Detection {
+            kind: Kind::Plain,
+            docroot: dir.path().to_path_buf(),
+            needs_router: false,
+        };
+        assert!(compatibility_warnings(dir.path(), &detection).is_empty());
+    }
+
+    #[test]
+    fn laravel_app_missing_vendor_and_env_gets_both_warnings() {
+        let dir = tempfile::tempdir().unwrap();
+        let detection = Detection {
+            kind: Kind::Laravel,
+            docroot: dir.path().join("public"),
+            needs_router: true,
+        };
+        let warnings = compatibility_warnings(dir.path(), &detection);
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings.iter().any(|w| w.contains("vendor/autoload.php")));
+        assert!(warnings.iter().any(|w| w.contains(".env")));
+    }
+
+    #[test]
+    fn laravel_app_with_vendor_and_env_gets_no_warnings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("vendor")).unwrap();
+        std::fs::write(dir.path().join("vendor").join("autoload.php"), "").unwrap();
+        std::fs::write(dir.path().join(".env"), "").unwrap();
+
+        let detection = Detection {
+            kind: Kind::Laravel,
+            docroot: dir.path().join("public"),
+            needs_router: true,
+        };
+        assert!(compatibility_warnings(dir.path(), &detection).is_empty());
+    }
+}

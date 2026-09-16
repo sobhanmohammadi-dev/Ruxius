@@ -1,5 +1,7 @@
 # Ruxius
 
+[![CI](https://github.com/sobhanmohammadi-dev/ruxius/actions/workflows/ci.yml/badge.svg)](https://github.com/sobhanmohammadi-dev/ruxius/actions/workflows/ci.yml)
+
 **Ruxius** packages a PHP web app into a standalone desktop executable —
 without ever recompiling anything. Built for Windows first (and that's
 the only platform this has actually been run on); macOS and Linux support
@@ -40,7 +42,7 @@ Any Ruxius executable checks for that footer on startup:
   clicking it) extracts and launches its bundled PHP + app — no commands
   needed.
 
-![How ruxius can work?](docs/img/how-ruxius-can-work.png)
+![how-ruxius-work-it](docs/img/how-ruxius-can-work.png)
 
 No compiler, no `cargo build`, involved in producing `out.exe` — just file
 copying and archiving.
@@ -516,6 +518,9 @@ isn't a separate implementation, just a different way to drive them.
 
 ```
 Ruxius/
+├── .github/
+│   └── workflows/
+│       └── ci.yml         # build + test on Windows, best-effort Linux/macOS
 ├── Cargo.toml
 ├── examples/
 │   └── sample-app/       # minimal PHP app to try `rux build` against
@@ -538,6 +543,12 @@ Ruxius/
     ├── logger.rs                                     # rotating file + stdout logging
     └── error.rs                                        # centralized error types
 ```
+
+`payload.rs`, `ext.rs`, `framework.rs`, and `icon.rs` each carry a
+`#[cfg(test)] mod tests` at the bottom rather than living in a separate
+`tests/` directory — they're unit tests of private/internal logic
+(fingerprinting, ini-line parsing, `.ico` byte layout), not
+black-box integration tests of the public CLI.
 
 ## Platform support
 
@@ -612,10 +623,38 @@ so multiple Ruxius apps (or multiple versions of the same app) never
 collide, and re-running `rux build` with unchanged inputs reuses the
 existing extraction instead of re-copying files.
 
+## Testing & CI
+
+```powershell
+cargo test
+```
+
+Unit tests cover the parts of the codebase that are pure logic and don't
+need an actual Windows/WebView environment to exercise: the `.ico`/
+`GRPICONDIR` parsing behind `--icon`, `php.ini` parsing and toggling
+(`ext.rs`), Laravel/Symfony detection (`framework.rs`), and the
+self-appending payload format itself — footer parsing, corruption
+detection, chained rebuilds, and the pack/unpack round trip
+(`payload.rs`). They intentionally don't touch anything that needs
+WebView2, a real PHP binary, or Win32 resource APIs — those stay
+integration-tested by hand for now.
+
+GitHub Actions (`.github/workflows/ci.yml`) runs `cargo build`+
+`cargo test` on Windows on every push/PR — that's the real, enforced gate,
+since Windows is the only platform this project actually ships for.
+`cargo fmt --check` and `cargo clippy` also run, but as informational
+steps rather than blocking ones, since this codebase hasn't been run
+through either yet; treat their output as a to-do list, not a red X.
+There's also a non-blocking best-effort job that builds and tests on
+Ubuntu and macOS — useful signal for the [platform support](#platform-support)
+situation, but not something a PR is expected to satisfy.
+
 ## Contributing
 
-Issues and pull requests are welcome. Please run `cargo fmt` and
-`cargo clippy` before submitting a PR.
+Issues and pull requests are welcome. Please run `cargo test`,
+`cargo fmt`, and `cargo clippy` before submitting a PR — none of them are
+enforced by CI yet (see above), which makes running them locally more
+important, not less.
 
 ## License
 
